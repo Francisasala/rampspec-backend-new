@@ -4,6 +4,7 @@ import {
   PROBE_MAX_RESPONSE_BYTES,
   PROBE_MAX_SUPPORTED_SEPS,
   PROBE_MAX_TOTAL_HEADER_BYTES,
+  ACCEPTED_DISCOVERY_CONTENT_TYPES,
   probeTarget,
 } from "./probe.js";
 
@@ -29,6 +30,17 @@ function chunkStream(
     },
   });
   return { body, pulled: () => pulled };
+}
+
+function fakeResponse(
+  headers: ReadonlyArray<readonly [string, string]>,
+  status = 200,
+): Response {
+  return {
+    headers,
+    ok: status >= 200 && status < 300,
+    status,
+  } as unknown as Response;
 }
 
 describe("target capability probe", () => {
@@ -63,6 +75,10 @@ describe("target capability probe", () => {
     expect(result.status).toBeNull();
     expect(result.budgetExceeded).toBe(false);
     expect(result.limitReason).toBeNull();
+    expect(result.contentType).toBeNull();
+    expect(result.contentTypeStatus).toBe("missing");
+    expect(result.contentTypeSupported).toBe(false);
+    expect(result.discoveryValid).toBe(false);
   });
 
   it("drains a small response body and stays reachable", async () => {
@@ -301,5 +317,197 @@ describe("target capability probe", () => {
     expect(result.limitReason).toBe("response-budget-exceeded");
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
     expect(JSON.stringify(result)).not.toContain("SEP-0001");
+  });
+
+  it("accepts the defined discovery content types", async () => {
+    expect([...ACCEPTED_DISCOVERY_CONTENT_TYPES]).toEqual([
+      "application/json",
+      "text/plain",
+    ]);
+    for (const contentType of ACCEPTED_DISCOVERY_CONTENT_TYPES) {
+      const result = await probeTarget("https://example.com", {
+        clock,
+        fetcher: vi.fn().mockResolvedValue(
+          new Response(null, {
+            headers: { "content-type": contentType },
+            status: 200,
+          }),
+        ),
+      });
+      expect(result.contentType).toBe(contentType);
+      expect(result.contentTypeStatus).toBe("accepted");
+      expect(result.contentTypeSupported).toBe(true);
+      expect(result.discoveryValid).toBe(true);
+      expect(result.reachable).toBe(true);
+    }
+  });
+
+  it("normalizes content types case-insensitively and strips parameters", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { "Content-Type": "Text/Plain; charset=UTF-8" },
+        status: 200,
+      }),
+    );
+    const result = await probeTarget("https://example.com", { fetcher, clock });
+    expect(result.contentType).toBe("text/plain");
+    expect(result.contentTypeStatus).toBe("accepted");
+    expect(result.discoveryValid).toBe(true);
+    // Only the normalized value is recorded, never the raw header.
+    expect(result.headers["content-type"]).toBe("text/plain");
+  });
+
+  it("distinguishes unsupported content from a valid discovery response", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "x-stellar-toml-version": "SEP-0001",
+        },
+        status: 200,
+      }),
+    );
+    const result = await probeTarget("https://example.com", { fetcher, clock });
+    expect(result.reachable).toBe(true);
+    expect(result.status).toBe(200);
+    expect(result.contentType).toBe("text/html");
+    expect(result.contentTypeStatus).toBe("unsupported");
+    expect(result.contentTypeSupported).toBe(false);
+    expect(result.discoveryValid).toBe(false);
+    expect(result.supportedSeps).toEqual(["SEP-0001"]);
+  });
+
+  it("falls back safely when the content type is missing", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { "x-stellar-toml-version": "SEP-0001" },
+        status: 200,
+      }),
+    );
+    const result = await probeTarget("https://example.com", { fetcher, clock });
+    expect(result.reachable).toBe(true);
+    expect(result.contentType).toBeNull();
+    expect(result.contentTypeStatus).toBe("missing");
+    expect(result.contentTypeSupported).toBe(false);
+    expect(result.discoveryValid).toBe(false);
+    expect(result.headers).not.toHaveProperty("content-type");
+  });
+
+  it("rejects injected header values without persisting them", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      fakeResponse([
+        ["Content-Type", "text/plain\r\nX-Injected: evil"],
+        ["X-Stellar-Toml-Version", "SEP-0001"],
+      ]),
+    );
+    const result = await probeTarget("https://example.com", { fetcher, clock });
+    expect(result.contentType).toBeNull();
+    expect(result.contentTypeStatus).toBe("malformed");
+    expect(result.contentTypeSupported).toBe(false);
+    expect(result.discoveryValid).toBe(false);
+    expect(result.headers).not.toHaveProperty("content-type");
+    expect(result.headers).not.toHaveProperty("x-injected");
+    expect(result.supportedSeps).toEqual(["SEP-0001"]);
+  });
+
+  it("rejects comma-joined content types as malformed", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      fakeResponse([["content-type", "text/plain, application/json"]]),
+    );
+    const result = await probeTarget("https://example.com", { fetcher, clock });
+    expect(result.contentType).toBeNull();
+    expect(result.contentTypeStatus).toBe("malformed");
+    expect(result.discoveryValid).toBe(false);
+  });
+
+  it("bounds content type values at 128 characters", async () => {
+    const atLimit = `text/plain; charset=${"x".repeat(108)}`;
+    expect(atLimit).toHaveLength(128);
+    const accepted = await probeTarget("https://example.com", {
+      clock,
+      fetcher: vi.fn().mockResolvedValue(fakeResponse([["content-type", atLimit]])),
+    });
+    expect(accepted.contentType).toBe("text/plain");
+    expect(accepted.contentTypeStatus).toBe("accepted");
+
+    const overLimit = `text/plain; charset=${"x".repeat(109)}`;
+    expect(overLimit).toHaveLength(129);
+    const rejected = await probeTarget("https://example.com", {
+      clock,
+      fetcher: vi
+        .fn()
+        .mockResolvedValue(fakeResponse([["content-type", overLimit]])),
+    });
+    expect(rejected.contentType).toBeNull();
+    expect(rejected.contentTypeStatus).toBe("malformed");
+    expect(rejected.discoveryValid).toBe(false);
+  });
+
+  it("bounds SEP version headers and drops unsafe entries", async () => {
+    const overLong = await probeTarget("https://example.com", {
+      clock,
+      fetcher: vi.fn().mockResolvedValue(
+        fakeResponse([
+          ["x-stellar-toml-version", `SEP-0001, ${"x".repeat(2000)}`],
+        ]),
+      ),
+    });
+    expect(overLong.supportedSeps).toEqual([]);
+    expect(overLong.headers).not.toHaveProperty("x-stellar-toml-version");
+
+    const many = Array.from({ length: 40 }, (_, index) => `SEP-${index + 1}`);
+    const capped = await probeTarget("https://example.com", {
+      clock,
+      fetcher: vi.fn().mockResolvedValue(
+        fakeResponse([
+          ["content-type", "text/plain"],
+          ["x-stellar-toml-version", [...many, "SEP-0001\r\nbad"].join(", ")],
+        ]),
+      ),
+    });
+    expect(capped.supportedSeps).toHaveLength(32);
+    expect(capped.supportedSeps).not.toContain("SEP-0001\r\nbad");
+  });
+
+  it("sends no credentials and strips credentials from the target URL", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(null, {
+        headers: { "content-type": "text/plain" },
+        status: 200,
+      }),
+    );
+    const result = await probeTarget("https://user:secret@example.com", {
+      fetcher,
+      clock,
+    });
+    expect(result.reachable).toBe(true);
+    const [url, init] = fetcher.mock.calls[0] as [URL, RequestInit];
+    expect(url.username).toBe("");
+    expect(url.password).toBe("");
+    expect(String(url)).not.toContain("user:secret@");
+    expect(init).not.toHaveProperty("credentials", "include");
+    expect(init.headers).toBeUndefined();
+  });
+
+  it("is deterministic for identical responses", async () => {
+    const buildFetcher = () =>
+      vi.fn().mockResolvedValue(
+        new Response(null, {
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "x-stellar-toml-version": "SEP-0001",
+          },
+          status: 200,
+        }),
+      );
+    const first = await probeTarget("https://example.com", {
+      clock,
+      fetcher: buildFetcher(),
+    });
+    const second = await probeTarget("https://example.com", {
+      clock,
+      fetcher: buildFetcher(),
+    });
+    expect(second).toEqual(first);
   });
 });

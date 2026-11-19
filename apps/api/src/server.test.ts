@@ -225,4 +225,65 @@ describe("reference run API", () => {
     expect(raw).not.toContain("SEP-0001");
     expect(pulls).toBeLessThan(10);
   });
+
+  it("records unsupported probe content types without failing the run", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const file = join(directory, "runs.json");
+    const clock = () => new Date("2026-11-09T16:00:00.000Z");
+    const executor = new ReferenceRunExecutor(new JsonRunRepository(file), {
+      allowedOrigins: ["https://anchor.example"],
+      clock,
+      fetcher: () =>
+        Promise.resolve(
+          new Response(null, {
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              "x-stellar-toml-version": "SEP-0001",
+            },
+            status: 200,
+          }),
+        ),
+    });
+    const started = await startApiServer({ executor, port: 0 });
+    servers.push(started.server);
+
+    const created = await fetch(`${started.url}/v1/reference-runs`, {
+      body: JSON.stringify({
+        projectId: ids.project,
+        suiteId: ids.suite,
+        suiteVersion: "1.0.0",
+        targetId: ids.target,
+        targetOrigin: "https://anchor.example",
+      }),
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "reviewer-reference-run-0004",
+        "X-RampSpec-Organization": ids.organization,
+      },
+      method: "POST",
+    });
+    expect(created.status).toBe(201);
+    const record = (await created.json()) as {
+      probe: {
+        contentType: string | null;
+        contentTypeStatus: string;
+        contentTypeSupported: boolean;
+        discoveryValid: boolean;
+        reachable: boolean;
+      };
+      report: { summary: { passed: number } };
+      run: { state: string };
+    };
+    expect(record.probe).toMatchObject({
+      contentType: "text/html",
+      contentTypeStatus: "unsupported",
+      contentTypeSupported: false,
+      discoveryValid: false,
+      reachable: true,
+    });
+    // Existing findings and run state are unchanged by the new probe fields.
+    expect(record.run.state).toBe("completed");
+    expect(record.report.summary.passed).toBe(2);
+  });
 });

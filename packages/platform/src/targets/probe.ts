@@ -1,3 +1,5 @@
+import { normalizeContentType } from "../execution/content-type.js";
+
 /** Maximum response-body bytes a target probe drains before aborting. */
 export const PROBE_MAX_RESPONSE_BYTES = 65_536;
 /** Maximum bytes of any single retained probe header value. */
@@ -8,6 +10,30 @@ export const PROBE_MAX_KEPT_HEADER_BYTES = 8_192;
 export const PROBE_MAX_TOTAL_HEADER_BYTES = 65_536;
 /** Maximum number of SEP identifiers retained from one probe. */
 export const PROBE_MAX_SUPPORTED_SEPS = 32;
+
+/**
+ * Discovery representations a capability probe accepts as a valid discovery
+ * response. Stellar discovery documents are plain text (`stellar.toml`) or
+ * JSON; anything else (for example an HTML error page) is recorded as
+ * unsupported content, never mistaken for a discovery document.
+ */
+export const ACCEPTED_DISCOVERY_CONTENT_TYPES = [
+  "application/json",
+  "text/plain",
+] as const;
+
+export type AcceptedDiscoveryContentType =
+  (typeof ACCEPTED_DISCOVERY_CONTENT_TYPES)[number];
+
+export type ProbeContentTypeStatus =
+  | "accepted"
+  | "malformed"
+  | "missing"
+  | "unsupported";
+
+const MAX_SEP_VERSION_HEADER_LENGTH = 1024;
+const MAX_SEP_LENGTH = 64;
+const SEP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 
 /** Header names a probe retains; every other header is dropped unread. */
 const RETAINED_HEADERS = ["content-type", "x-stellar-toml-version"] as const;
@@ -27,6 +53,16 @@ export interface CapabilityProbe {
   readonly budgetExceeded: boolean;
   /** Which budget was exceeded, or null when the probe stayed in budget. */
   readonly limitReason: ProbeLimitReason | null;
+  /** Normalized discovery media type, or null when absent or unusable. */
+  readonly contentType: string | null;
+  readonly contentTypeSupported: boolean;
+  readonly contentTypeStatus: ProbeContentTypeStatus;
+  /**
+   * True only for a reachable target that answered with an accepted discovery
+   * content type. A missing, malformed, or unsupported content type is never
+   * treated as valid discovery (safe fallback); reachability is unaffected.
+   */
+  readonly discoveryValid: boolean;
 }
 
 export interface ProbeTargetOptions {
@@ -76,6 +112,20 @@ function positiveBudget(value: number | undefined, fallback: number): number {
   return Math.floor(resolved);
 }
 
+function parseSupportedSeps(
+  raw: string | undefined,
+  maxSupportedSeps: number,
+): string[] {
+  if (raw === undefined) return [];
+  if (raw.length > MAX_SEP_VERSION_HEADER_LENGTH) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && value.length <= MAX_SEP_LENGTH)
+    .filter((value) => SEP_PATTERN.test(value))
+    .slice(0, maxSupportedSeps);
+}
+
 function unreachableProbe(
   clock: () => Date,
   status: number | null,
@@ -85,6 +135,10 @@ function unreachableProbe(
   return Object.freeze({
     budgetExceeded,
     checkedAt: clock().toISOString(),
+    contentType: null,
+    contentTypeStatus: "missing",
+    contentTypeSupported: false,
+    discoveryValid: false,
     headers: {},
     limitReason,
     reachable: false,
@@ -101,6 +155,9 @@ export async function probeTarget(
   if (url.protocol !== "https:") {
     throw new Error("Target probe requires HTTPS.");
   }
+  // Never send credentials embedded in a target URL to the target.
+  url.username = "";
+  url.password = "";
   const clock = options.clock ?? (() => new Date());
   const maxResponseBytes = positiveBudget(
     options.maxResponseBytes,
@@ -148,9 +205,16 @@ export async function probeTarget(
       return unreachableProbe(clock, response.status, true, reason);
     };
 
+    // Header entries work for both a Headers object and an array of tuples.
+    const headerEntries: Array<readonly [string, string]> = [
+      ...response.headers,
+    ];
+
     // A declared body larger than the budget is refused without reading it.
     const declaredLength = Number(
-      response.headers.get("content-length") ?? "",
+      headerEntries.find(
+        ([key]) => key.toLowerCase() === "content-length",
+      )?.[1] ?? "",
     );
     if (
       Number.isFinite(declaredLength) &&
@@ -161,18 +225,17 @@ export async function probeTarget(
 
     // Retain only the protocol headers, each bounded, and bound the raw
     // header total so a flood of dropped headers cannot grow memory either.
-    const headers: Record<string, string> = {};
+    let rawContentType: string | undefined;
+    let rawSepHeader: string | undefined;
     let keptHeaderBytes = 0;
     let totalHeaderBytes = 0;
-    for (const [key, value] of response.headers) {
+    for (const [key, value] of headerEntries) {
       totalHeaderBytes += utf8ByteLength(key) + utf8ByteLength(value);
       if (totalHeaderBytes > maxTotalHeaderBytes) {
         return overBudget("header-budget-exceeded");
       }
       const name = key.toLowerCase();
-      if (
-        (RETAINED_HEADERS as readonly string[]).includes(name)
-      ) {
+      if ((RETAINED_HEADERS as readonly string[]).includes(name)) {
         const valueBytes = utf8ByteLength(value);
         if (valueBytes > maxHeaderValueBytes) {
           return overBudget("header-budget-exceeded");
@@ -181,7 +244,8 @@ export async function probeTarget(
         if (keptHeaderBytes > maxKeptHeaderBytes) {
           return overBudget("header-budget-exceeded");
         }
-        headers[name] = value;
+        if (name === "content-type") rawContentType = value;
+        else rawSepHeader = value;
       }
     }
 
@@ -214,14 +278,33 @@ export async function probeTarget(
       }
     }
 
-    const supportedSeps = (headers["x-stellar-toml-version"] ?? "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean)
-      .slice(0, maxSupportedSeps);
+    const contentType = normalizeContentType(rawContentType);
+    const contentTypeStatus: ProbeContentTypeStatus =
+      rawContentType === undefined
+        ? "missing"
+        : contentType === null
+          ? "malformed"
+          : (
+                ACCEPTED_DISCOVERY_CONTENT_TYPES as readonly string[]
+              ).includes(contentType)
+            ? "accepted"
+            : "unsupported";
+    const contentTypeSupported = contentTypeStatus === "accepted";
+    const supportedSeps = parseSupportedSeps(rawSepHeader, maxSupportedSeps);
+    // Record only the normalized content type and the sanitized SEP list;
+    // arbitrary or hostile header values are never persisted.
+    const headers: Record<string, string> = {};
+    if (contentType !== null) headers["content-type"] = contentType;
+    if (supportedSeps.length > 0) {
+      headers["x-stellar-toml-version"] = supportedSeps.join(", ");
+    }
     return Object.freeze({
       budgetExceeded: false,
       checkedAt: clock().toISOString(),
+      contentType,
+      contentTypeStatus,
+      contentTypeSupported,
+      discoveryValid: response.ok && contentTypeSupported,
       headers,
       limitReason: null,
       reachable: response.ok,

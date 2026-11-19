@@ -765,6 +765,31 @@
               "checkedAt": {
                 "$ref": "#/components/schemas/UtcTimestamp"
               },
+              "contentType": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "contentTypeStatus": {
+                "enum": [
+                  "accepted",
+                  "malformed",
+                  "missing",
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "contentTypeSupported": {
+                "type": "boolean"
+              },
+              "discoveryValid": {
+                "type": "boolean"
+              },
               "headers": {
                 "additionalProperties": {
                   "maxLength": 4096,
@@ -812,6 +837,10 @@
             "required": [
               "budgetExceeded",
               "checkedAt",
+              "contentType",
+              "contentTypeStatus",
+              "contentTypeSupported",
+              "discoveryValid",
               "headers",
               "limitReason",
               "reachable",

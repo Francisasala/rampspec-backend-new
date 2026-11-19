@@ -497,6 +497,13 @@ export const openApiDocument = {
             properties: {
               budgetExceeded: { type: "boolean" },
               checkedAt: { $ref: "#/components/schemas/UtcTimestamp" },
+              contentType: { oneOf: [{ type: "string" }, { type: "null" }] },
+              contentTypeStatus: {
+                enum: ["accepted", "malformed", "missing", "unsupported"],
+                type: "string",
+              },
+              contentTypeSupported: { type: "boolean" },
+              discoveryValid: { type: "boolean" },
               headers: {
                 additionalProperties: { maxLength: 4096, type: "string" },
                 type: "object",
@@ -525,6 +532,10 @@ export const openApiDocument = {
             required: [
               "budgetExceeded",
               "checkedAt",
+              "contentType",
+              "contentTypeStatus",
+              "contentTypeSupported",
+              "discoveryValid",
               "headers",
               "limitReason",
               "reachable",
