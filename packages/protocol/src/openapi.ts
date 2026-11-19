@@ -1346,6 +1346,8 @@ export const openApiDocument = {
         tags: ["Targets"],
       },
       post: {
+        description:
+          "A proof presented at exactly expiresAt is expired: the challenge lifetime is exclusive.",
         operationId: "verifyOwnershipChallenge",
         parameters: [
           ...mutationOperationParameters,
@@ -1377,6 +1379,50 @@ export const openApiDocument = {
           "404": { $ref: "#/components/responses/Problem" },
         },
         summary: "Verify an ownership challenge",
+        tags: ["Targets"],
+      },
+    },
+    "/v1/ownership-challenges/{verificationId}/renew": {
+      post: {
+        description:
+          "Issues a fresh challenge and token for the same target and method and moves the previous challenge to a terminal state. The previous token is never usable again.",
+        operationId: "renewOwnershipChallenge",
+        parameters: [
+          ...mutationOperationParameters,
+          { $ref: "#/components/parameters/VerificationPathId" },
+        ],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                additionalProperties: false,
+                properties: {
+                  ttlSeconds: { maximum: 86400, minimum: 60, type: "integer" },
+                },
+                type: "object",
+              },
+            },
+          },
+          required: false,
+        },
+        responses: {
+          "201": jsonResponse("Ownership challenge renewed.", {
+            additionalProperties: false,
+            properties: {
+              challenge: { $ref: "#/components/schemas/OwnershipChallenge" },
+              previous: { $ref: "#/components/schemas/OwnershipChallenge" },
+              token: { minLength: 1, type: "string" },
+            },
+            required: ["challenge", "previous", "token"],
+            type: "object",
+          }),
+          "400": { $ref: "#/components/responses/Problem" },
+          "401": { $ref: "#/components/responses/Problem" },
+          "403": { $ref: "#/components/responses/Problem" },
+          "404": { $ref: "#/components/responses/Problem" },
+          "409": { $ref: "#/components/responses/Problem" },
+        },
+        summary: "Renew an ownership challenge",
         tags: ["Targets"],
       },
     },
