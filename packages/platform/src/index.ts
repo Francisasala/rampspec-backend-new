@@ -22,6 +22,8 @@ export * from "./runs/service.js";
 export * from "./runs/state-machine.js";
 export * from "./runs/attempts.js";
 export * from "./targets/probe.js";
+export * from "./targets/outbound-address-policy.js";
+export * from "./targets/pinned-fetch.js";
 export * from "./execution/request.js";
 export * from "./execution/response.js";
 export * from "./evidence/capture.js";
