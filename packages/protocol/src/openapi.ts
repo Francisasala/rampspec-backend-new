@@ -495,18 +495,38 @@ export const openApiDocument = {
           probe: {
             additionalProperties: false,
             properties: {
+              budgetExceeded: { type: "boolean" },
               checkedAt: { $ref: "#/components/schemas/UtcTimestamp" },
               headers: {
-                additionalProperties: { type: "string" },
+                additionalProperties: { maxLength: 4096, type: "string" },
                 type: "object",
+              },
+              limitReason: {
+                oneOf: [
+                  {
+                    enum: [
+                      "content-length-budget-exceeded",
+                      "header-budget-exceeded",
+                      "response-budget-exceeded",
+                    ],
+                    type: "string",
+                  },
+                  { type: "null" },
+                ],
               },
               reachable: { type: "boolean" },
               status: { oneOf: [{ type: "integer" }, { type: "null" }] },
-              supportedSeps: { items: { type: "string" }, type: "array" },
+              supportedSeps: {
+                items: { maxLength: 4096, type: "string" },
+                maxItems: 32,
+                type: "array",
+              },
             },
             required: [
+              "budgetExceeded",
               "checkedAt",
               "headers",
+              "limitReason",
               "reachable",
               "status",
               "supportedSeps",
