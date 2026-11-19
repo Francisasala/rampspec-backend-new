@@ -30,6 +30,7 @@ export * from "./evidence/capture.js";
 export * from "./evidence/access.js";
 export * from "./reports/generate.js";
 export * from "./reports/sign.js";
+export * from "./delivery/circuit-breaker.js";
 export * from "./delivery/service.js";
 export * from "./delivery/webhook.js";
 export * from "./scheduler/service.js";

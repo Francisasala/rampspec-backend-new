@@ -34,3 +34,35 @@ so the probe defends against DNS rebinding before it connects:
   (`reachable: false`, `status: null`) and the run records a failed
   `target-reachable` finding. The probe response shape is unchanged, so no
   OpenAPI or migration change is required for this policy.
+
+## Webhook delivery circuit breakers
+
+Repeated failures to one webhook endpoint open a delivery circuit for that
+tenant and endpoint, so a failing receiver cannot consume workers or amplify
+an incident. Circuit state is persisted in
+`rampspec.webhook_circuit_breakers`, keyed by organization and integration.
+
+- **Closed (default):** delivery proceeds. Failures are counted inside a
+  60-second window; 5 failures in that window open the circuit. A success
+  clears the window.
+- **Open:** delivery attempts to the endpoint are paused. Accepted
+  deliveries stay queued as pending and are never dropped; they are retried
+  after the cooldown using the usual exponential retry delay.
+- **Half-open:** after a 30-second cooldown, exactly one probe delivery is
+  admitted. A successful probe closes the circuit and resumes delivery; a
+  failed probe re-opens it for another full cooldown.
+
+Circuits are scoped per tenant and endpoint: one tenant's open circuit never
+pauses delivery for another tenant or for a different endpoint of the same
+tenant.
+
+Circuit state is exposed through metrics:
+
+- `webhook_circuit_breaker_failures_total` — recorded endpoint failures.
+- `webhook_circuit_breaker_transitions_total{state=open|half-open|closed}` —
+  circuit open, probe, and close transitions.
+- `webhook_circuit_breaker_probes_total` — admitted half-open probes.
+
+Recovery is automatic and needs no manual queue surgery. If an endpoint is
+decommissioned, disable its integration instead of clearing circuit rows;
+rows disappear with the integration through the cascading delete.
