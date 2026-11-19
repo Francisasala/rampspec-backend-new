@@ -6,7 +6,11 @@ import {
   parseId,
   toUtcTimestamp,
 } from "../../../domain/src/index.js";
-import type { OidcVerifier, VerifiedOidcClaims } from "./oidc.js";
+import type {
+  OidcAuthorizationFlow,
+  OidcVerifier,
+  VerifiedOidcClaims,
+} from "./oidc.js";
 
 export interface SessionRecord {
   readonly assurance: {
@@ -77,6 +81,18 @@ export interface SessionCredentials {
   readonly expiresAt: string;
   readonly sessionId: string;
   readonly sessionToken: string;
+}
+
+/**
+ * OIDC callback binding for `SessionService.exchange`. When present, the
+ * callback `state` is single-use consumed before the identity token is
+ * verified, and the token nonce must match the initiating request. When
+ * absent, exchange keeps its previous behaviour for callers that already
+ * validated the callback.
+ */
+export interface OidcCallback {
+  readonly flow: OidcAuthorizationFlow;
+  readonly state: string;
 }
 
 export interface SessionPrincipal {
@@ -173,12 +189,32 @@ export class SessionService {
       readonly ipPrefixHash?: string;
       readonly userAgentHash?: string;
     } = {},
+    callback?: OidcCallback,
   ): Promise<SessionCredentials> {
     assertDigest(binding.ipPrefixHash, "IP prefix hash");
     assertDigest(binding.userAgentHash, "User-agent hash");
+    let expectedNonceHash: string | undefined;
+    if (callback !== undefined) {
+      try {
+        ({ nonceHash: expectedNonceHash } = await callback.flow.consume(
+          callback.state,
+          now,
+        ));
+      } catch {
+        await this.options.audit.record({
+          action: "login.failed",
+          reason: "callback_rejected",
+        });
+        throw authenticationError("The identity provider token was rejected.");
+      }
+    }
     let claims: VerifiedOidcClaims;
     try {
-      claims = await this.options.verifier.verify(idToken, now);
+      claims = await this.options.verifier.verify(
+        idToken,
+        now,
+        expectedNonceHash === undefined ? undefined : { expectedNonceHash },
+      );
       this.assertAssurance(claims);
     } catch {
       await this.options.audit.record({
