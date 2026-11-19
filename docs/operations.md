@@ -66,3 +66,13 @@ Circuit state is exposed through metrics:
 Recovery is automatic and needs no manual queue surgery. If an endpoint is
 decommissioned, disable its integration instead of clearing circuit rows;
 rows disappear with the integration through the cascading delete.
+## Scheduler leases
+
+A scheduled job runs under an exclusive lease (`rampspec.scheduler_leases`, one row per schedule) so at most one scheduler instance owns a schedule for the duration of a job.
+
+- **Acquisition:** a scheduler acquires a lease for an enabled schedule with a TTL between 30 and 3600 seconds and receives an opaque ownership token and version 1. A second acquisition while the lease is live fails with `already_leased`; an expired lease may be taken over.
+- **Renewal:** while work is active the owner renews with compare-and-set semantics — the renewal succeeds only when the stored row still carries the same owner id, token, and version and has not expired. Each success increments the version and renewal count and extends the expiry by one TTL. Renew at an interval well under the TTL (at most half) and bound the total renewals and runtime per job; the defaults cap renewals at 100 per job.
+- **Loss of ownership:** a renewal that matches no row means the lease expired, was released, or was taken over. The owner must abort the in-flight job immediately and must not emit a completion event for work that lost ownership. Completion events are emitted only after a final ownership check at job end.
+- **Authorization:** lease acquisition, renewal, and release require the `schedule.lease` action in the caller's organization; cross-tenant renewal or release is denied. Treat the lease token as a credential: never log it or expose it outside the owning scheduler.
+- **Observability:** the scheduler emits `lease.acquired`, `lease.renewed`, `lease.renewal_failed`, `lease.expired`, `lease.released`, `job.completed`, and `job.aborted` events. A `job.aborted` event with reason `lease_lost` means a job was fenced off; investigate duplicate scheduler instances or a TTL shorter than the job's renewal cadence.
+- **Expiry reaping:** expired rows are inert and are replaced on the next acquisition for the same schedule; `scheduler_leases_expires_at_idx` supports reaping them in bulk.
