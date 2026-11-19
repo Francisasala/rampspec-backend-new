@@ -96,6 +96,12 @@ export const openApiDocument = {
         required: true,
         schema: { $ref: "#/components/schemas/SecretReferenceId" },
       },
+      SessionPathId: {
+        in: "path",
+        name: "sessionId",
+        required: true,
+        schema: { $ref: "#/components/schemas/SessionId" },
+      },
     },
     responses: {
       Problem: {
@@ -456,6 +462,27 @@ export const openApiDocument = {
           "deletedAt",
           "createdAt",
         ],
+        type: "object",
+      },
+      SessionId: {
+        pattern:
+          "^session_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        type: "string",
+      },
+      SessionRevocation: {
+        additionalProperties: false,
+        properties: {
+          revokedAt: { $ref: "#/components/schemas/UtcTimestamp" },
+          sessionId: { $ref: "#/components/schemas/SessionId" },
+        },
+        required: ["sessionId", "revokedAt"],
+        type: "object",
+      },
+      SessionRevocationRequest: {
+        additionalProperties: false,
+        properties: {
+          reason: { maxLength: 128, minLength: 1, type: "string" },
+        },
         type: "object",
       },
       PageInfo: {
@@ -1411,6 +1438,34 @@ export const openApiDocument = {
         tags: ["Targets"],
       },
     },
+    "/v1/sessions/{sessionId}": {
+      delete: {
+        operationId: "revokeSession",
+        parameters: [
+          ...mutationOperationParameters,
+          { $ref: "#/components/parameters/SessionPathId" },
+        ],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/SessionRevocationRequest" },
+            },
+          },
+          required: false,
+        },
+        responses: {
+          "200": jsonResponse("Session revoked.", {
+            $ref: "#/components/schemas/SessionRevocation",
+          }),
+          "400": { $ref: "#/components/responses/Problem" },
+          "401": { $ref: "#/components/responses/Problem" },
+          "403": { $ref: "#/components/responses/Problem" },
+          "404": { $ref: "#/components/responses/Problem" },
+        },
+        summary: "Revoke a session",
+        tags: ["Sessions"],
+      },
+    },
     "/v1/targets/{targetId}/secret-references": {
       get: {
         operationId: "listSecretReferences",
@@ -1528,6 +1583,10 @@ export const openApiDocument = {
     {
       description: "Service metadata and authenticated context.",
       name: "System",
+    },
+    {
+      description: "Web session lifecycle and revocation.",
+      name: "Sessions",
     },
     {
       description: "Tenant organizations and membership lifecycle.",

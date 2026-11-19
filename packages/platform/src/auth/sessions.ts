@@ -3,6 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   createId,
   DomainError,
+  parseId,
   toUtcTimestamp,
 } from "../../../domain/src/index.js";
 import type { OidcVerifier, VerifiedOidcClaims } from "./oidc.js";
@@ -30,6 +31,7 @@ export interface SessionRecord {
 
 export interface SessionStore {
   insert(record: SessionRecord): Promise<void>;
+  findById(sessionId: string): Promise<SessionRecord | undefined>;
   findByTokenHash(tokenHash: string): Promise<SessionRecord | undefined>;
   replaceToken(
     previousTokenHash: string,
@@ -37,6 +39,11 @@ export interface SessionStore {
   ): Promise<boolean>;
   revoke(
     tokenHash: string,
+    revokedAt: string,
+    reason: string,
+  ): Promise<boolean>;
+  revokeById(
+    sessionId: string,
     revokedAt: string,
     reason: string,
   ): Promise<boolean>;
@@ -117,6 +124,36 @@ function authenticationError(
     status: 401,
     title: "Authentication Required",
   });
+}
+
+// One error for every unresolvable revocation target (malformed, missing,
+// or owned by another user) so callers cannot probe for session existence.
+function sessionNotFoundError(): DomainError {
+  return new DomainError({
+    code: "session-not-found",
+    detail: "The session does not exist or cannot be revoked.",
+    status: 404,
+    title: "Session Not Found",
+  });
+}
+
+const MAX_REVOKE_REASON_LENGTH = 128;
+
+function assertRevokeReason(reason: string | undefined): string {
+  if (reason === undefined) return "user_revoked";
+  if (
+    typeof reason !== "string" ||
+    reason.length < 1 ||
+    reason.length > MAX_REVOKE_REASON_LENGTH
+  ) {
+    throw new DomainError({
+      code: "invalid-revocation-reason",
+      detail: "The revocation reason must be between 1 and 128 characters.",
+      status: 400,
+      title: "Invalid Revocation Reason",
+    });
+  }
+  return reason;
 }
 
 export class SessionService {
@@ -313,6 +350,66 @@ export class SessionService {
     });
   }
 
+  /**
+   * Revoke one session selected by its identifier.
+   *
+   * The caller authenticates with their own session token and CSRF token.
+   * Only a session owned by the caller can be revoked; malformed, missing,
+   * and foreign session identifiers all fail with the same not-found error
+   * so session existence cannot be enumerated. Revocation is idempotent:
+   * repeating it returns the original revocation time without emitting a
+   * second audit record. Server state is invalidated before the audit
+   * record is emitted and before success is returned.
+   */
+  async revokeSession(input: {
+    readonly csrfToken: string;
+    readonly reason?: string;
+    readonly sessionToken: string;
+    readonly targetSessionId: string;
+    readonly now?: Date;
+  }): Promise<{ readonly revokedAt: string; readonly sessionId: string }> {
+    const now = input.now ?? new Date();
+    const principal = await this.authenticate(input.sessionToken, {
+      csrfToken: input.csrfToken,
+      method: "POST",
+      now,
+    });
+    const reason = assertRevokeReason(input.reason);
+    let targetSessionId: string;
+    try {
+      targetSessionId = parseId("session", input.targetSessionId);
+    } catch {
+      throw sessionNotFoundError();
+    }
+    const record = await this.options.store.findById(targetSessionId);
+    if (!record || record.userId !== principal.userId) {
+      throw sessionNotFoundError();
+    }
+    if (record.revokedAt) {
+      return { revokedAt: record.revokedAt, sessionId: record.id };
+    }
+    const revokedAt = toUtcTimestamp(now);
+    const revoked = await this.options.store.revokeById(
+      record.id,
+      revokedAt,
+      reason,
+    );
+    if (!revoked) {
+      // Lost a race with a concurrent revocation; the session is already
+      // invalidated, so report the stored revocation time.
+      const current = await this.options.store.findById(record.id);
+      if (!current?.revokedAt) throw sessionNotFoundError();
+      return { revokedAt: current.revokedAt, sessionId: current.id };
+    }
+    await this.options.audit.record({
+      action: "session.revoked",
+      reason,
+      sessionId: record.id,
+      userId: principal.userId,
+    });
+    return { revokedAt, sessionId: record.id };
+  }
+
   async revokeUser(
     userId: string,
     reason: string,
@@ -341,6 +438,13 @@ export class InMemorySessionStore implements SessionStore {
     }
     this.sessions.set(record.tokenHash, Object.freeze(record));
     return Promise.resolve();
+  }
+
+  findById(sessionId: string): Promise<SessionRecord | undefined> {
+    for (const record of this.sessions.values()) {
+      if (record.id === sessionId) return Promise.resolve(record);
+    }
+    return Promise.resolve(undefined);
   }
 
   findByTokenHash(tokenHash: string): Promise<SessionRecord | undefined> {
@@ -374,6 +478,24 @@ export class InMemorySessionStore implements SessionStore {
       revokeReason: reason,
     });
     return Promise.resolve(true);
+  }
+
+  revokeById(
+    sessionId: string,
+    revokedAt: string,
+    reason: string,
+  ): Promise<boolean> {
+    for (const [tokenHash, record] of this.sessions) {
+      if (record.id !== sessionId) continue;
+      if (record.revokedAt) return Promise.resolve(false);
+      this.sessions.set(tokenHash, {
+        ...record,
+        revokedAt,
+        revokeReason: reason,
+      });
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(false);
   }
 
   revokeUser(
