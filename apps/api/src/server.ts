@@ -12,10 +12,13 @@ import { pathToFileURL } from "node:url";
 import type { OpaqueId } from "../../../packages/domain/src/index.js";
 import {
   generateReport,
+  liveness,
   probeTarget,
+  readiness,
   RunService,
   type CapabilityProbe,
   type GeneratedReport,
+  type HealthCheck,
   type Run,
   type RunRepository,
 } from "../../../packages/platform/src/index.js";
@@ -244,7 +247,12 @@ function requireString(record: Record<string, unknown>, key: string): string {
   return value;
 }
 
-export function createApiHandler(executor: ReferenceRunExecutor) {
+export function createApiHandler(
+  executor: ReferenceRunExecutor,
+  options: {
+    readonly readinessChecks?: readonly HealthCheck[];
+  } = {},
+) {
   return async (
     request: IncomingMessage,
     response: ServerResponse,
@@ -259,10 +267,22 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
       }
       if (request.method === "GET" && url.pathname === "/health") {
         sendJson(response, 200, {
+          ...liveness(),
           persistence: "json-file",
-          status: "ok",
           version,
         });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/ready") {
+        const defaultChecks: readonly HealthCheck[] = options.readinessChecks ?? [
+          { check: () => Promise.resolve(true), name: "database" },
+          { check: () => Promise.resolve(true), name: "objectStore" },
+          { check: () => Promise.resolve(true), name: "scheduler" },
+          { check: () => Promise.resolve(true), name: "signing" },
+        ];
+        const result = await readiness(defaultChecks);
+        const statusCode = result.status === "ready" ? 200 : 503;
+        sendJson(response, statusCode, result);
         return;
       }
       if (request.method === "GET" && url.pathname === "/version") {
@@ -329,6 +349,7 @@ export async function startApiServer(
     readonly executor?: ReferenceRunExecutor;
     readonly host?: string;
     readonly port?: number;
+    readonly readinessChecks?: readonly HealthCheck[];
   } = {},
 ): Promise<{ readonly server: Server; readonly url: string }> {
   const repository = new JsonRunRepository(
@@ -352,6 +373,9 @@ export async function startApiServer(
       new ReferenceRunExecutor(repository, {
         ...(allowedOrigins.length > 0 ? { allowedOrigins } : {}),
       }),
+    {
+      ...(options.readinessChecks ? { readinessChecks: options.readinessChecks } : {}),
+    },
   );
   const server = createServer((request, response) => {
     void handler(request, response);
