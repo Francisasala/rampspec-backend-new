@@ -312,19 +312,32 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
         sendJson(response, 201, result);
         return;
       }
-      const match = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)$/u.exec(
+      const runMatch = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)(?:\/status)?$/u.exec(
         url.pathname,
       );
-      if (request.method === "GET" && match?.[1]) {
+      if (request.method === "GET" && runMatch?.[1]) {
         const organizationId = request.headers["x-rampspec-organization"];
         if (typeof organizationId !== "string")
           throw new Error("X-RampSpec-Organization is required.");
-        const record = await executor.find(organizationId, match[1]);
+        const record = await executor.find(organizationId, runMatch[1]);
         if (!record) {
           sendJson(response, 404, { status: 404, title: "Run not found" });
           return;
         }
-        sendJson(response, 200, record);
+        const isStatusRequest = url.pathname.endsWith("/status");
+        if (isStatusRequest) {
+          const status = {
+            id: record.run.id,
+            state: record.run.state,
+            createdAt: record.run.createdAt,
+            ...(record.run.state === "completed" || record.run.state === "failed"
+              ? { completedAt: record.report?.createdAt || record.run.createdAt }
+              : {}),
+          };
+          sendJson(response, 200, status);
+        } else {
+          sendJson(response, 200, record);
+        }
         return;
       }
       sendJson(response, 404, { status: 404, title: "Route not found" });
