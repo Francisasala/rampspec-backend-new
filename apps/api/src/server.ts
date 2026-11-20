@@ -21,7 +21,14 @@ import {
 } from "../../../packages/platform/src/index.js";
 
 const version = "0.1.0";
-const maximumBodyBytes = 32_768;
+export const defaultBodyBudgets = {
+  health: 0,
+  runs: 32_768,
+  version: 0,
+  webhook: 65_536,
+  verification: 16_384,
+  default: 32_768,
+} as const;
 
 export interface ReferenceRunRecord {
   readonly probe?: CapabilityProbe;
@@ -224,14 +231,40 @@ function sendJson(
   response.end(`${JSON.stringify(value)}\n`);
 }
 
-async function readJson(request: IncomingMessage): Promise<unknown> {
+export class PayloadTooLargeError extends Error {
+  public readonly status = 413;
+  public readonly code = "payload-too-large";
+
+  public constructor(message = "Request body exceeds route budget.") {
+    super(message);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+async function readJson(
+  request: IncomingMessage,
+  budget: number = defaultBodyBudgets.default,
+): Promise<unknown> {
+  const contentLengthHeader = request.headers["content-length"];
+  if (contentLengthHeader !== undefined) {
+    const declaredLength = Number.parseInt(contentLengthHeader, 10);
+    if (!Number.isNaN(declaredLength) && declaredLength > budget) {
+      throw new PayloadTooLargeError(
+        `Declared content length (${declaredLength} bytes) exceeds budget of ${budget} bytes.`,
+      );
+    }
+  }
+
   const chunks: Uint8Array[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.byteLength;
-    if (length > maximumBodyBytes)
-      throw new Error("Request body is too large.");
+    if (length > budget) {
+      throw new PayloadTooLargeError(
+        `Request body exceeded budget of ${budget} bytes.`,
+      );
+    }
     chunks.push(buffer);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -270,7 +303,7 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/reference-runs") {
-        const body = await readJson(request);
+        const body = await readJson(request, defaultBodyBudgets.runs);
         if (!body || typeof body !== "object" || Array.isArray(body))
           throw new Error("JSON object required.");
         const record = body as Record<string, unknown>;
@@ -314,6 +347,15 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
       }
       sendJson(response, 404, { status: 404, title: "Route not found" });
     } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        sendJson(response, 413, {
+          detail: error.message,
+          status: 413,
+          title: "Payload Too Large",
+          type: "https://rampspec.dev/problems/payload-too-large",
+        });
+        return;
+      }
       sendJson(response, 400, {
         detail: error instanceof Error ? error.message : "Invalid request.",
         status: 400,
