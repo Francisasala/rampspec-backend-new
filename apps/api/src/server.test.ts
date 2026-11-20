@@ -192,4 +192,32 @@ describe("reference run API", () => {
     expect(problem.title).toBe("Payload Too Large");
     expect(problem.type).toBe("https://rampspec.dev/problems/payload-too-large");
   });
+
+  it("drains in-flight requests during graceful shutdown and rejects new connections", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    expect(started.shutdownManager.draining).toBe(false);
+    expect(started.shutdownManager.inFlight).toBe(0);
+
+    // Verify health endpoint before shutdown
+    const healthBefore = await fetch(`${started.url}/health`);
+    expect(healthBefore.status).toBe(200);
+
+    // Initiate shutdown
+    const shutdownPromise = started.shutdownManager.shutdown({ deadlineMs: 2000 });
+    expect(started.shutdownManager.draining).toBe(true);
+
+    // Wait for shutdown to complete
+    await shutdownPromise;
+    expect(started.shutdownManager.inFlight).toBe(0);
+
+    // Subsequent requests to the server after closing should fail connection
+    await expect(fetch(`${started.url}/health`)).rejects.toThrow();
+  });
 });

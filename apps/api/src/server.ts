@@ -6,6 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import type { Socket } from "node:net";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -365,6 +366,71 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
   };
 }
 
+export interface GracefulShutdownOptions {
+  readonly deadlineMs?: number;
+}
+
+export class GracefulServerManager {
+  private activeConnections = 0;
+  private isDraining = false;
+  private readonly sockets = new Set<Socket>();
+
+  constructor(
+    private readonly server: Server,
+    private readonly defaultDeadlineMs = 5000,
+  ) {
+    server.on("connection", (socket) => {
+      this.sockets.add(socket);
+      socket.on("close", () => {
+        this.sockets.delete(socket);
+      });
+    });
+  }
+
+  public get draining(): boolean {
+    return this.isDraining;
+  }
+
+  public get inFlight(): number {
+    return this.activeConnections;
+  }
+
+  public trackRequest(): () => void {
+    if (this.isDraining) {
+      throw new Error("Server is shutting down and draining requests.");
+    }
+    this.activeConnections += 1;
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        this.activeConnections = Math.max(0, this.activeConnections - 1);
+      }
+    };
+  }
+
+  public async shutdown(options: GracefulShutdownOptions = {}): Promise<void> {
+    if (this.isDraining) return;
+    this.isDraining = true;
+    const deadlineMs = options.deadlineMs ?? this.defaultDeadlineMs;
+
+    // Stop accepting new connections
+    await new Promise<void>((resolveClose) => {
+      this.server.close(() => resolveClose());
+    });
+
+    const startTime = Date.now();
+    while (this.activeConnections > 0 && Date.now() - startTime < deadlineMs) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+
+    // If deadline exceeded and sockets remain open, force-close remaining connections
+    for (const socket of this.sockets) {
+      socket.destroy();
+    }
+  }
+}
+
 export async function startApiServer(
   options: {
     readonly dataFile?: string;
@@ -372,7 +438,11 @@ export async function startApiServer(
     readonly host?: string;
     readonly port?: number;
   } = {},
-): Promise<{ readonly server: Server; readonly url: string }> {
+): Promise<{
+  readonly server: Server;
+  readonly shutdownManager: GracefulServerManager;
+  readonly url: string;
+}> {
   const repository = new JsonRunRepository(
     options.dataFile ??
       resolve(process.env.RAMPSPEC_DATA_FILE ?? ".data/reference-runs.json"),
@@ -395,9 +465,29 @@ export async function startApiServer(
         ...(allowedOrigins.length > 0 ? { allowedOrigins } : {}),
       }),
   );
-  const server = createServer((request, response) => {
+
+  const server = createServer();
+  const shutdownManager = new GracefulServerManager(server);
+  server.on("request", (request, response) => {
+    if (shutdownManager.draining) {
+      response.statusCode = 503;
+      response.setHeader("Connection", "close");
+      response.setHeader("Content-Type", "application/json; charset=utf-8");
+      response.end(
+        JSON.stringify({
+          detail: "Server is draining in-flight requests and shutting down.",
+          status: 503,
+          title: "Service Unavailable",
+        }) + "\n",
+      );
+      return;
+    }
+    const release = shutdownManager.trackRequest();
+    response.on("finish", () => release());
+    response.on("close", () => release());
     void handler(request, response);
   });
+
   const host = options.host ?? "127.0.0.1";
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
@@ -410,7 +500,11 @@ export async function startApiServer(
   const address = server.address();
   if (!address || typeof address === "string")
     throw new Error("API server address is unavailable.");
-  return { server, url: `http://${host}:${address.port}` };
+  return {
+    server,
+    shutdownManager,
+    url: `http://${host}:${address.port}`,
+  };
 }
 
 if (
