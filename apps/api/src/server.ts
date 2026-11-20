@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 
 import type { OpaqueId } from "../../../packages/domain/src/index.js";
 import {
+  createSafeRequestLog,
   generateReport,
   liveness,
   probeTarget,
@@ -19,8 +20,10 @@ import {
   type CapabilityProbe,
   type GeneratedReport,
   type HealthCheck,
+  type RequestLogEntry,
   type Run,
   type RunRepository,
+  type SafeActorClass,
 } from "../../../packages/platform/src/index.js";
 
 const version = "0.1.0";
@@ -250,6 +253,7 @@ function requireString(record: Record<string, unknown>, key: string): string {
 export function createApiHandler(
   executor: ReferenceRunExecutor,
   options: {
+    readonly onLog?: (log: RequestLogEntry) => void;
     readonly readinessChecks?: readonly HealthCheck[];
   } = {},
 ) {
@@ -257,15 +261,40 @@ export function createApiHandler(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> => {
+    const started = performance.now();
+    let routeTemplate = "unknown";
+    let actorClass: SafeActorClass = "anonymous";
+    const correlationId =
+      (request.headers["x-request-id"] as string | undefined) ??
+      (request.headers["idempotency-key"] as string | undefined) ??
+      randomUUID();
+
+    response.on("finish", () => {
+      const durationMs = performance.now() - started;
+      const log = createSafeRequestLog({
+        actorClass,
+        correlationId,
+        durationMs,
+        method: request.method ?? "GET",
+        routeTemplate,
+        status: response.statusCode,
+      });
+      if (options.onLog) {
+        options.onLog(log);
+      }
+    });
+
     applyCors(request, response);
     try {
       const url = new URL(request.url ?? "/", "http://localhost");
       if (request.method === "OPTIONS") {
+        routeTemplate = "OPTIONS";
         response.statusCode = 204;
         response.end();
         return;
       }
       if (request.method === "GET" && url.pathname === "/health") {
+        routeTemplate = "/health";
         sendJson(response, 200, {
           ...liveness(),
           persistence: "json-file",
@@ -274,6 +303,7 @@ export function createApiHandler(
         return;
       }
       if (request.method === "GET" && url.pathname === "/ready") {
+        routeTemplate = "/ready";
         const defaultChecks: readonly HealthCheck[] = options.readinessChecks ?? [
           { check: () => Promise.resolve(true), name: "database" },
           { check: () => Promise.resolve(true), name: "objectStore" },
@@ -286,10 +316,13 @@ export function createApiHandler(
         return;
       }
       if (request.method === "GET" && url.pathname === "/version") {
+        routeTemplate = "/version";
         sendJson(response, 200, { api: "v1", version });
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/reference-runs") {
+        routeTemplate = "/v1/reference-runs";
+        actorClass = "authenticated";
         const body = await readJson(request);
         if (!body || typeof body !== "object" || Array.isArray(body))
           throw new Error("JSON object required.");
@@ -321,6 +354,8 @@ export function createApiHandler(
         url.pathname,
       );
       if (request.method === "GET" && match?.[1]) {
+        routeTemplate = "/v1/reference-runs/{runId}";
+        actorClass = "authenticated";
         const organizationId = request.headers["x-rampspec-organization"];
         if (typeof organizationId !== "string")
           throw new Error("X-RampSpec-Organization is required.");
@@ -332,6 +367,7 @@ export function createApiHandler(
         sendJson(response, 200, record);
         return;
       }
+      routeTemplate = "not_found";
       sendJson(response, 404, { status: 404, title: "Route not found" });
     } catch (error) {
       sendJson(response, 400, {
@@ -348,6 +384,7 @@ export async function startApiServer(
     readonly dataFile?: string;
     readonly executor?: ReferenceRunExecutor;
     readonly host?: string;
+    readonly onLog?: (log: RequestLogEntry) => void;
     readonly port?: number;
     readonly readinessChecks?: readonly HealthCheck[];
   } = {},
@@ -374,6 +411,7 @@ export async function startApiServer(
         ...(allowedOrigins.length > 0 ? { allowedOrigins } : {}),
       }),
     {
+      ...(options.onLog ? { onLog: options.onLog } : {}),
       ...(options.readinessChecks ? { readinessChecks: options.readinessChecks } : {}),
     },
   );

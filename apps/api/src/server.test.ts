@@ -209,4 +209,36 @@ describe("reference run API", () => {
     expect(body.status).toBe("not_ready");
     expect(body.components.objectStore?.ready).toBe(false);
   });
+
+  it("emits privacy-safe structured request logs without sensitive fields", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const logs: unknown[] = [];
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      onLog: (entry) => logs.push(entry),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const healthRes = await fetch(`${started.url}/health`);
+    expect(healthRes.status).toBe(200);
+
+    // Wait for finish event to trigger log callback
+    await new Promise((r) => setTimeout(r, 50));
+    expect(logs.length).toBeGreaterThanOrEqual(1);
+    const firstLog = logs[0] as Record<string, unknown>;
+    expect(firstLog).toMatchObject({
+      actorClass: "anonymous",
+      method: "GET",
+      routeTemplate: "/health",
+      status: 200,
+    });
+    expect(typeof firstLog.durationMs).toBe("number");
+    expect(typeof firstLog.correlationId).toBe("string");
+    expect(firstLog).not.toHaveProperty("body");
+    expect(firstLog).not.toHaveProperty("headers");
+    expect(firstLog).not.toHaveProperty("token");
+    expect(firstLog).not.toHaveProperty("targetOrigin");
+  });
 });
