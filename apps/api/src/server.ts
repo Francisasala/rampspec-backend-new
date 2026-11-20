@@ -13,6 +13,8 @@ import type { OpaqueId } from "../../../packages/domain/src/index.js";
 import {
   generateReport,
   probeTarget,
+  QuotaExceededError,
+  RunQuotaManager,
   RunService,
   type CapabilityProbe,
   type GeneratedReport,
@@ -113,6 +115,7 @@ export class JsonRunRepository implements RunRepository {
 
 export class ReferenceRunExecutor {
   private readonly runs: RunService;
+  private readonly quotaManager: RunQuotaManager;
 
   public constructor(
     private readonly repository: JsonRunRepository,
@@ -120,10 +123,22 @@ export class ReferenceRunExecutor {
       readonly allowedOrigins?: readonly string[];
       readonly clock?: () => Date;
       readonly fetcher?: typeof fetch;
+      readonly quotaManager?: RunQuotaManager;
     } = {},
   ) {
+    // Default quota: 10 concurrent runs, 100 runs per minute per tenant
+    this.quotaManager =
+      options.quotaManager ??
+      new RunQuotaManager({
+        concurrentLimit: 10,
+        windowedLimit: 100,
+        windowMs: 60_000,
+        ...(options.clock ? { clock: options.clock } : {}),
+      });
+
     this.runs = new RunService({
       repository,
+      quotaManager: this.quotaManager,
       ...(options.clock ? { clock: options.clock } : {}),
     });
   }
@@ -314,6 +329,18 @@ export function createApiHandler(executor: ReferenceRunExecutor) {
       }
       sendJson(response, 404, { status: 404, title: "Route not found" });
     } catch (error) {
+      if (error instanceof QuotaExceededError) {
+        response.setHeader("Retry-After", error.retryAfterSeconds.toString());
+        sendJson(response, error.status, {
+          code: error.code,
+          detail: error.message,
+          retryAfterSeconds: error.retryAfterSeconds,
+          status: error.status,
+          title: `${error.type} quota exceeded`,
+          type: `https://rampspec.dev/problems/quota-exceeded-${error.type}`,
+        });
+        return;
+      }
       sendJson(response, 400, {
         detail: error instanceof Error ? error.message : "Invalid request.",
         status: 400,
