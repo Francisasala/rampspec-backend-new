@@ -1,20 +1,36 @@
 import { createHash, type KeyObject, sign, verify } from "node:crypto";
 
+export interface SignatureMetadata {
+  readonly keyId?: string;
+  readonly activationVersion?: number;
+}
+
 export interface SignedReport {
   readonly algorithm: "ed25519";
   readonly payload: string;
   readonly signature: string;
+  readonly keyId?: string;
+  readonly activationVersion?: number;
 }
 
 export function signReport(
   report: Readonly<Record<string, unknown>>,
   privateKey: KeyObject,
+  metadata?: SignatureMetadata,
 ): SignedReport {
   const payload = JSON.stringify(report);
+  const signature = sign(null, Buffer.from(payload), privateKey).toString(
+    "base64url",
+  );
+
   return Object.freeze({
     algorithm: "ed25519",
+    ...(metadata?.keyId !== undefined ? { keyId: metadata.keyId } : {}),
+    ...(metadata?.activationVersion !== undefined
+      ? { activationVersion: metadata.activationVersion }
+      : {}),
     payload,
-    signature: sign(null, Buffer.from(payload), privateKey).toString("base64url"),
+    signature,
   });
 }
 
@@ -173,7 +189,11 @@ export function verifyReportBundle(
 
   // Signature verification (only if ed25519, valid payload, and key resolved)
   let signatureValid: boolean | undefined;
-  if (publicKey && signedReport.algorithm === "ed25519" && typeof signedReport.payload === "string") {
+  if (
+    publicKey &&
+    signedReport.algorithm === "ed25519" &&
+    typeof signedReport.payload === "string"
+  ) {
     try {
       signatureValid = verifyReport(
         {
