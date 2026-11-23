@@ -2,7 +2,7 @@ import { createHash, type KeyObject, sign, verify } from "node:crypto";
 
 export interface SignatureMetadata {
   readonly keyId?: string;
-  readonly activationVersion?: number;
+  readonly activationVersion?: number | undefined;
 }
 
 export interface SignedReport {
