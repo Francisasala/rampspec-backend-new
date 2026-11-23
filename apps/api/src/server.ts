@@ -6,6 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import type { Socket } from "node:net";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -23,7 +24,14 @@ import {
 } from "../../../packages/platform/src/index.js";
 
 const version = "0.1.0";
-const maximumBodyBytes = 32_768;
+export const defaultBodyBudgets = {
+  health: 0,
+  runs: 32_768,
+  version: 0,
+  webhook: 65_536,
+  verification: 16_384,
+  default: 32_768,
+} as const;
 
 export interface ReferenceRunRecord {
   readonly probe?: CapabilityProbe;
@@ -226,14 +234,40 @@ function sendJson(
   response.end(`${JSON.stringify(value)}\n`);
 }
 
-async function readJson(request: IncomingMessage): Promise<unknown> {
+export class PayloadTooLargeError extends Error {
+  public readonly status = 413;
+  public readonly code = "payload-too-large";
+
+  public constructor(message = "Request body exceeds route budget.") {
+    super(message);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+async function readJson(
+  request: IncomingMessage,
+  budget: number = defaultBodyBudgets.default,
+): Promise<unknown> {
+  const contentLengthHeader = request.headers["content-length"];
+  if (contentLengthHeader !== undefined) {
+    const declaredLength = Number.parseInt(contentLengthHeader, 10);
+    if (!Number.isNaN(declaredLength) && declaredLength > budget) {
+      throw new PayloadTooLargeError(
+        `Declared content length (${declaredLength} bytes) exceeds budget of ${budget} bytes.`,
+      );
+    }
+  }
+
   const chunks: Uint8Array[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.byteLength;
-    if (length > maximumBodyBytes)
-      throw new Error("Request body is too large.");
+    if (length > budget) {
+      throw new PayloadTooLargeError(
+        `Request body exceeded budget of ${budget} bytes.`,
+      );
+    }
     chunks.push(buffer);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -264,7 +298,10 @@ export function createApiHandler(
         return;
       }
       if (request.method === "GET" && url.pathname === "/health") {
-        metrics.increment("http_requests_total", { endpoint: "health", status: "200" });
+        metrics.increment("http_requests_total", {
+          endpoint: "health",
+          status: "200",
+        });
         sendJson(response, 200, {
           persistence: "json-file",
           status: "ok",
@@ -273,7 +310,10 @@ export function createApiHandler(
         return;
       }
       if (request.method === "GET" && url.pathname === "/version") {
-        metrics.increment("http_requests_total", { endpoint: "version", status: "200" });
+        metrics.increment("http_requests_total", {
+          endpoint: "version",
+          status: "200",
+        });
         sendJson(response, 200, { api: "v1", version });
         return;
       }
@@ -287,7 +327,10 @@ export function createApiHandler(
             : request.headers["x-metrics-key"];
           if (token !== requiredSecret) {
             response.statusCode = 401;
-            response.setHeader("Content-Type", "application/json; charset=utf-8");
+            response.setHeader(
+              "Content-Type",
+              "application/json; charset=utf-8",
+            );
             response.end(
               JSON.stringify({
                 detail: "Unauthorized metrics scrape.",
@@ -308,8 +351,10 @@ export function createApiHandler(
         return;
       }
       if (request.method === "POST" && url.pathname === "/v1/reference-runs") {
-        metrics.increment("api_requests_total", { operation: "reference_runs_create" });
-        const body = await readJson(request);
+        metrics.increment("api_requests_total", {
+          operation: "reference_runs_create",
+        });
+        const body = await readJson(request, defaultBodyBudgets.runs);
         if (!body || typeof body !== "object" || Array.isArray(body))
           throw new Error("JSON object required.");
         const record = body as Record<string, unknown>;
@@ -353,6 +398,15 @@ export function createApiHandler(
       }
       sendJson(response, 404, { status: 404, title: "Route not found" });
     } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        sendJson(response, 413, {
+          detail: error.message,
+          status: 413,
+          title: "Payload Too Large",
+          type: "https://rampspec.dev/problems/payload-too-large",
+        });
+        return;
+      }
       sendJson(response, 400, {
         detail: error instanceof Error ? error.message : "Invalid request.",
         status: 400,
@@ -360,6 +414,71 @@ export function createApiHandler(
       });
     }
   };
+}
+
+export interface GracefulShutdownOptions {
+  readonly deadlineMs?: number;
+}
+
+export class GracefulServerManager {
+  private activeConnections = 0;
+  private isDraining = false;
+  private readonly sockets = new Set<Socket>();
+
+  constructor(
+    private readonly server: Server,
+    private readonly defaultDeadlineMs = 5000,
+  ) {
+    server.on("connection", (socket) => {
+      this.sockets.add(socket);
+      socket.on("close", () => {
+        this.sockets.delete(socket);
+      });
+    });
+  }
+
+  public get draining(): boolean {
+    return this.isDraining;
+  }
+
+  public get inFlight(): number {
+    return this.activeConnections;
+  }
+
+  public trackRequest(): () => void {
+    if (this.isDraining) {
+      throw new Error("Server is shutting down and draining requests.");
+    }
+    this.activeConnections += 1;
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        this.activeConnections = Math.max(0, this.activeConnections - 1);
+      }
+    };
+  }
+
+  public async shutdown(options: GracefulShutdownOptions = {}): Promise<void> {
+    if (this.isDraining) return;
+    this.isDraining = true;
+    const deadlineMs = options.deadlineMs ?? this.defaultDeadlineMs;
+
+    // Stop accepting new connections
+    await new Promise<void>((resolveClose) => {
+      this.server.close(() => resolveClose());
+    });
+
+    const startTime = Date.now();
+    while (this.activeConnections > 0 && Date.now() - startTime < deadlineMs) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+
+    // If deadline exceeded and sockets remain open, force-close remaining connections
+    for (const socket of this.sockets) {
+      socket.destroy();
+    }
+  }
 }
 
 export async function startApiServer(
@@ -371,7 +490,11 @@ export async function startApiServer(
     readonly metrics?: Metrics;
     readonly metricsSecret?: string;
   } = {},
-): Promise<{ readonly server: Server; readonly url: string }> {
+): Promise<{
+  readonly server: Server;
+  readonly shutdownManager: GracefulServerManager;
+  readonly url: string;
+}> {
   const repository = new JsonRunRepository(
     options.dataFile ??
       resolve(process.env.RAMPSPEC_DATA_FILE ?? ".data/reference-runs.json"),
@@ -395,12 +518,34 @@ export async function startApiServer(
       }),
     {
       ...(options.metrics ? { metrics: options.metrics } : {}),
-      ...(options.metricsSecret ? { metricsSecret: options.metricsSecret } : {}),
+      ...(options.metricsSecret
+        ? { metricsSecret: options.metricsSecret }
+        : {}),
     },
   );
-  const server = createServer((request, response) => {
+
+  const server = createServer();
+  const shutdownManager = new GracefulServerManager(server);
+  server.on("request", (request, response) => {
+    if (shutdownManager.draining) {
+      response.statusCode = 503;
+      response.setHeader("Connection", "close");
+      response.setHeader("Content-Type", "application/json; charset=utf-8");
+      response.end(
+        JSON.stringify({
+          detail: "Server is draining in-flight requests and shutting down.",
+          status: 503,
+          title: "Service Unavailable",
+        }) + "\n",
+      );
+      return;
+    }
+    const release = shutdownManager.trackRequest();
+    response.on("finish", () => release());
+    response.on("close", () => release());
     void handler(request, response);
   });
+
   const host = options.host ?? "127.0.0.1";
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
@@ -413,7 +558,11 @@ export async function startApiServer(
   const address = server.address();
   if (!address || typeof address === "string")
     throw new Error("API server address is unavailable.");
-  return { server, url: `http://${host}:${address.port}` };
+  return {
+    server,
+    shutdownManager,
+    url: `http://${host}:${address.port}`,
+  };
 }
 
 if (
