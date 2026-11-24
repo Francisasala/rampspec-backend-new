@@ -6,6 +6,13 @@ export interface RateLimitDecision {
   readonly retryAfterSeconds: number;
 }
 
+export interface QuotaDecision {
+  readonly allowed: boolean;
+  readonly concurrentUsage: number;
+  readonly concurrentLimit: number;
+  readonly retryAfterSeconds: number;
+}
+
 export interface RateLimitHeaders {
   readonly "RateLimit-Limit": string;
   readonly "RateLimit-Remaining": string;
@@ -80,5 +87,48 @@ export class RateLimiter {
       resetEpochSeconds,
       retryAfterSeconds: 0,
     };
+  }
+}
+
+export class RunQuotaManager {
+  private readonly concurrentRuns = new Map<string, number>();
+  private readonly windowedRuns = new Map<string, number[]>();
+
+  public constructor(private readonly options: {
+    readonly concurrentLimit: number;
+    readonly windowedLimit: number;
+    readonly windowMs: number;
+    readonly clock?: () => number;
+  }) {}
+
+  public checkConcurrent(tenantId: string): QuotaDecision {
+    const usage = this.concurrentRuns.get(tenantId) ?? 0;
+    return { allowed: usage < this.options.concurrentLimit, concurrentUsage: usage, concurrentLimit: this.options.concurrentLimit, retryAfterSeconds: usage < this.options.concurrentLimit ? 0 : 1 };
+  }
+
+  public checkWindowed(tenantId: string): QuotaDecision {
+    const now = (this.options.clock ?? Date.now)();
+    const active = (this.windowedRuns.get(tenantId) ?? []).filter((timestamp) => timestamp > now - this.options.windowMs);
+    this.windowedRuns.set(tenantId, active);
+    const allowed = active.length < this.options.windowedLimit;
+    return { allowed, concurrentUsage: active.length, concurrentLimit: this.options.windowedLimit, retryAfterSeconds: allowed ? 0 : Math.max(1, Math.ceil((active[0]! + this.options.windowMs - now) / 1000)) };
+  }
+
+  public acquireConcurrent(tenantId: string): boolean {
+    if (!this.checkConcurrent(tenantId).allowed) return false;
+    this.concurrentRuns.set(tenantId, (this.concurrentRuns.get(tenantId) ?? 0) + 1);
+    return true;
+  }
+
+  public recordWindowed(tenantId: string): void {
+    const now = (this.options.clock ?? Date.now)();
+    const active = (this.windowedRuns.get(tenantId) ?? []).filter((timestamp) => timestamp > now - this.options.windowMs);
+    active.push(now);
+    this.windowedRuns.set(tenantId, active);
+  }
+
+  public releaseConcurrent(tenantId: string): void {
+    const usage = this.concurrentRuns.get(tenantId) ?? 0;
+    if (usage > 0) this.concurrentRuns.set(tenantId, usage - 1);
   }
 }
