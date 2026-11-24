@@ -1,4 +1,12 @@
 import { normalizeContentType } from "../execution/content-type.js";
+import { isIP } from "node:net";
+import {
+  DEFAULT_RESOLUTION_TIMEOUT_MS,
+  resolveTargetAddresses,
+  validateResolvedAddresses,
+  type TargetAddressResolver,
+} from "./outbound-address-policy.js";
+import { createPinnedFetcher } from "./pinned-fetch.js";
 
 /** Maximum response-body bytes a target probe drains before aborting. */
 export const PROBE_MAX_RESPONSE_BYTES = 65_536;
@@ -26,10 +34,7 @@ export type AcceptedDiscoveryContentType =
   (typeof ACCEPTED_DISCOVERY_CONTENT_TYPES)[number];
 
 export type ProbeContentTypeStatus =
-  | "accepted"
-  | "malformed"
-  | "missing"
-  | "unsupported";
+  "accepted" | "malformed" | "missing" | "unsupported";
 
 const MAX_SEP_VERSION_HEADER_LENGTH = 1024;
 const MAX_SEP_LENGTH = 64;
@@ -74,6 +79,7 @@ export interface ProbeTargetOptions {
   readonly maxKeptHeaderBytes?: number;
   readonly maxTotalHeaderBytes?: number;
   readonly maxSupportedSeps?: number;
+  readonly resolver?: TargetAddressResolver;
 }
 
 /** UTF-8 byte length without allocating a copy of the value. */
@@ -85,11 +91,7 @@ function utf8ByteLength(value: string): number {
       bytes += 1;
     } else if (code <= 0x7ff) {
       bytes += 2;
-    } else if (
-      code >= 0xd800 &&
-      code <= 0xdbff &&
-      index + 1 < value.length
-    ) {
+    } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
       const next = value.charCodeAt(index + 1);
       if (next >= 0xdc00 && next <= 0xdfff) {
         bytes += 4;
@@ -179,13 +181,29 @@ export async function probeTarget(
     options.maxSupportedSeps,
     PROBE_MAX_SUPPORTED_SEPS,
   );
-  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 5000;
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    options.timeoutMs ?? 5000,
-  );
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const resolutionHost = url.hostname.replace(/^\[|\]$/gu, "");
+    const resolver =
+      options.resolver ??
+      (options.fetcher && isIP(resolutionHost) === 0
+        ? () =>
+            Promise.resolve([{ address: "93.184.216.34", family: 4 as const }])
+        : undefined);
+    const resolved = await resolveTargetAddresses(
+      resolutionHost,
+      resolver,
+      Math.min(timeoutMs, DEFAULT_RESOLUTION_TIMEOUT_MS),
+    );
+    const { pinned } = validateResolvedAddresses(resolved);
+    const fetcher =
+      options.fetcher ??
+      createPinnedFetcher(pinned, {
+        ...(options.resolver ? { resolver: options.resolver } : {}),
+        timeoutMs,
+      });
     const response = await fetcher(url, {
       method: "HEAD",
       redirect: "error",
@@ -216,10 +234,7 @@ export async function probeTarget(
         ([key]) => key.toLowerCase() === "content-length",
       )?.[1] ?? "",
     );
-    if (
-      Number.isFinite(declaredLength) &&
-      declaredLength > maxResponseBytes
-    ) {
+    if (Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) {
       return overBudget("content-length-budget-exceeded");
     }
 
@@ -284,9 +299,9 @@ export async function probeTarget(
         ? "missing"
         : contentType === null
           ? "malformed"
-          : (
-                ACCEPTED_DISCOVERY_CONTENT_TYPES as readonly string[]
-              ).includes(contentType)
+          : (ACCEPTED_DISCOVERY_CONTENT_TYPES as readonly string[]).includes(
+                contentType,
+              )
             ? "accepted"
             : "unsupported";
     const contentTypeSupported = contentTypeStatus === "accepted";

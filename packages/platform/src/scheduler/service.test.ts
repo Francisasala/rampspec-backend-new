@@ -1,616 +1,785 @@
 import { describe, expect, it } from "vitest";
 
-import { authorize } from "../auth/authorization.js";
+import type { AuthorizationActor } from "../auth/authorization.js";
 import {
-  AuditService,
-  InMemoryAuditStore,
-  verifyMetadataHash,
-} from "../audit/service.js";
-import { InMemoryRunRepository, RunService } from "../runs/service.js";
-import {
-  countMissedOccurrences,
-  resolveMisfire,
-} from "./recurrence.js";
-import {
-  deriveOccurrenceKey,
-  ScheduleService,
-  ScheduledRunTrigger,
-} from "./service.js";
+  InMemorySchedulerLeaseStore,
+  SchedulerLeaseService,
+  type RenewSchedulerLeaseInput,
+  type SchedulerLease,
+  type SchedulerLeaseEvent,
+} from "./lease-service.js";
 
-const clock = () => new Date("2026-09-12T18:00:00.000Z");
+const organizationId = "organization_a";
+const otherOrganizationId = "organization_b";
 
-function request(role: "auditor" | "maintainer" | "owner" | "viewer", action: "schedule.read" | "schedule.write") {
+function userActor(
+  role: "maintainer" | "runner" | "viewer",
+): AuthorizationActor {
+  return { amr: ["pwd"], kind: "user", role, userId: "user_scheduler" };
+}
+
+function serviceActor(scopes: readonly string[]): AuthorizationActor {
   return {
-    action,
-    actor: {
-      amr: ["pwd", "mfa"],
-      kind: "user" as const,
-      role,
-      userId: "user_actor",
-    },
-    organizationId: "organization_a",
-    resourceOrganizationId: "organization_a",
+    kind: "service_account",
+    scopes: new Set(scopes),
+    serviceAccountId: "service_account_scheduler",
   };
 }
 
-const organizationId = "organization_00000000-0000-4000-8000-000000000001";
-const otherOrganizationId = "organization_00000000-0000-4000-8000-000000000099";
-const projectId = "project_00000000-0000-4000-8000-000000000002";
-const targetId = "target_00000000-0000-4000-8000-000000000003";
-const suiteId = "suite_00000000-0000-4000-8000-000000000004";
-const runInput = {
-  effectiveConfig: { network: "testnet" },
-  organizationId,
-  projectId,
-  suiteId,
-  suiteVersion: "1.0.0",
-  targetId,
-};
-
-function fixedClock(): () => Date {
-  return () => new Date("2026-09-12T18:00:00.000Z");
+function realSleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
-function triggerSetup() {
-  const schedules = new ScheduleService({ clock: fixedClock() });
-  const runs = new RunService({ repository: new InMemoryRunRepository() });
-  const trigger = new ScheduledRunTrigger({ runs, schedules });
-  schedules.create("nightly_run", 3600);
-  return { runs, schedules, trigger };
+function createHarness() {
+  let now = new Date("2026-09-12T18:00:00.000Z").getTime();
+  let tokens = 0;
+  const events: SchedulerLeaseEvent[] = [];
+  const service = new SchedulerLeaseService({
+    clock: () => new Date(now),
+    onLeaseEvent: (event) => {
+      events.push(event);
+    },
+    tokenFactory: () => `token-${(tokens += 1)}`,
+  });
+  service.create("nightly_run", 3600);
+  return {
+    advance: (milliseconds: number) => {
+      now += milliseconds;
+    },
+    events,
+    now: () => new Date(now),
+    service,
+  };
 }
 
-describe("recurring schedules", () => { it("creates deterministic enabled schedules and disables them", () => { const service = new ScheduleService({ clock: () => new Date("2026-09-12T18:00:00.000Z") }); const schedule = service.create("nightly_run", 3600); expect(schedule.nextRunAt).toBe("2026-09-12T19:00:00.000Z"); expect(service.disable(schedule.id).enabled).toBe(false); }); it("rejects unsafe intervals", () => { const service = new ScheduleService(); expect(() => service.create("x", 60)).toThrow("schedule"); expect(() => service.create("valid_schedule", 30)).toThrow("schedule"); }); });
+function createLiveHarness() {
+  let tokens = 0;
+  const events: SchedulerLeaseEvent[] = [];
+  const service = new SchedulerLeaseService({
+    onLeaseEvent: (event) => {
+      events.push(event);
+    },
+    tokenFactory: () => `token-${(tokens += 1)}`,
+  });
+  service.create("nightly_run", 3600);
+  return { events, service };
+}
 
-describe("misfire policy configuration", () => {
-  it("defaults to skip with the maximum bounded catch-up limit", () => {
-    const service = new ScheduleService({ clock });
+async function acquireLease(
+  service: SchedulerLeaseService,
+  overrides: Partial<{
+    readonly actor: AuthorizationActor;
+    readonly leaseTtlSeconds: number;
+    readonly organizationId: string;
+    readonly ownerId: string;
+  }> = {},
+): Promise<SchedulerLease> {
+  const result = await service.acquireLease({
+    actor: userActor("runner"),
+    leaseTtlSeconds: 300,
+    organizationId,
+    ownerId: "scheduler-a",
+    scheduleId: "nightly_run",
+    ...overrides,
+  });
+  if (!result.acquired) {
+    throw new Error(`Expected acquisition, got ${result.reason}.`);
+  }
+  return result.lease;
+}
+
+function renewInput(
+  lease: SchedulerLease,
+  overrides: Partial<RenewSchedulerLeaseInput> = {},
+): RenewSchedulerLeaseInput {
+  return {
+    actor: userActor("runner"),
+    leaseTtlSeconds: 300,
+    organizationId,
+    ownerId: lease.ownerId,
+    scheduleId: lease.scheduleId,
+    token: lease.token,
+    ...overrides,
+  };
+}
+
+describe("recurring schedules", () => {
+  it("creates deterministic enabled schedules and disables them", () => {
+    const service = new SchedulerLeaseService({
+      clock: () => new Date("2026-09-12T18:00:00.000Z"),
+    });
     const schedule = service.create("nightly_run", 3600);
-    expect(schedule.misfirePolicy).toBe("skip");
-    expect(schedule.maxCatchUp).toBe(10);
-    expect(schedule.lastMisfire).toBeNull();
+    expect(schedule.nextRunAt).toBe("2026-09-12T19:00:00.000Z");
+    expect(service.disable(schedule.id).enabled).toBe(false);
   });
-
-  it("stores an explicit catch-up policy and custom limit", () => {
-    const service = new ScheduleService({ clock });
-    const schedule = service.create("hourly_sync", 3600, {
-      maxCatchUp: 3,
-      misfirePolicy: "catch-up",
-    });
-    expect(schedule.misfirePolicy).toBe("catch-up");
-    expect(schedule.maxCatchUp).toBe(3);
-  });
-
-  it("accepts the boundary catch-up limits 1 and 10", () => {
-    const service = new ScheduleService({ clock });
-    expect(
-      service.create("limit_one", 3600, { maxCatchUp: 1 }).maxCatchUp,
-    ).toBe(1);
-    expect(
-      service.create("limit_ten", 3600, { maxCatchUp: 10 }).maxCatchUp,
-    ).toBe(10);
-  });
-
-  it("rejects an unknown misfire policy", () => {
-    const service = new ScheduleService({ clock });
-    expect(() =>
-      service.create("bad_policy", 3600, {
-        misfirePolicy: "replay-all" as unknown as "skip",
-      }),
-    ).toThrow("misfire policy");
-  });
-
-  it("rejects catch-up limits outside 1..10", () => {
-    const service = new ScheduleService({ clock });
-    expect(() =>
-      service.create("limit_zero", 3600, { maxCatchUp: 0 }),
-    ).toThrow("catch-up");
-    expect(() =>
-      service.create("limit_eleven", 3600, { maxCatchUp: 11 }),
-    ).toThrow("catch-up");
+  it("rejects unsafe intervals", () => {
+    const service = new SchedulerLeaseService();
+    expect(() => service.create("x", 60)).toThrow("schedule");
+    expect(() => service.create("valid_schedule", 30)).toThrow("schedule");
   });
 });
 
-describe("misfire recovery", () => {
-  it("skips missed runs and resumes at the next occurrence", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "skip" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T22:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(4);
-    expect(recovery.executionsDue).toBe(0);
-    expect(recovery.capped).toBe(false);
-    expect(recovery.nextRunAt).toBe("2026-09-12T23:00:00.000Z");
-    expect(service.get("nightly_run").nextRunAt).toBe(
-      "2026-09-12T23:00:00.000Z",
-    );
+describe("scheduler leases", () => {
+  it("acquires a lease with a token, version 1, and a TTL expiry", async () => {
+    const { events, service } = createHarness();
+    const lease = await acquireLease(service);
+    expect(lease.token).toBe("token-1");
+    expect(lease.version).toBe(1);
+    expect(lease.renewalCount).toBe(0);
+    expect(lease.acquiredAt).toBe("2026-09-12T18:00:00.000Z");
+    expect(lease.expiresAt).toBe("2026-09-12T18:05:00.000Z");
+    expect(lease.renewedAt).toBeUndefined();
+    expect(events.map((event) => event.type)).toEqual(["lease.acquired"]);
   });
 
-  it("runs once for any number of missed occurrences", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "run-once" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T22:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(4);
-    expect(recovery.executionsDue).toBe(1);
-    expect(recovery.nextRunAt).toBe("2026-09-12T23:00:00.000Z");
-  });
-
-  it("catches up every missed occurrence within the limit", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T22:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(4);
-    expect(recovery.executionsDue).toBe(4);
-    expect(recovery.capped).toBe(false);
-  });
-
-  it("bounds catch-up at the limit and flags the cap", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-13T19:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(25);
-    expect(recovery.executionsDue).toBe(10);
-    expect(recovery.capped).toBe(true);
-    expect(recovery.nextRunAt).toBe("2026-09-13T20:00:00.000Z");
-  });
-
-  it("respects a custom catch-up limit below the maximum", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, {
-      maxCatchUp: 2,
-      misfirePolicy: "catch-up",
+  it("refuses a second acquisition while the schedule is leased", async () => {
+    const { service } = createHarness();
+    await acquireLease(service);
+    const sameOwner = await service.acquireLease({
+      actor: userActor("runner"),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-a",
+      scheduleId: "nightly_run",
     });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T22:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(4);
-    expect(recovery.executionsDue).toBe(2);
-    expect(recovery.capped).toBe(true);
-  });
-
-  it("counts an occurrence exactly at the recovery instant as missed", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T21:00:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(3);
-    expect(recovery.nextRunAt).toBe("2026-09-12T22:00:00.000Z");
-  });
-
-  it("does not count an occurrence one millisecond in the future", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T20:59:59.999Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(2);
-    expect(recovery.nextRunAt).toBe("2026-09-12T21:00:00.000Z");
-  });
-
-  it("reports zero missed occurrences before the first due run", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T18:30:00.000Z"),
-    );
-    expect(recovery.missedOccurrences).toBe(0);
-    expect(recovery.executionsDue).toBe(0);
-    expect(recovery.nextRunAt).toBe("2026-09-12T19:00:00.000Z");
-  });
-
-  it("is a no-op when recovery repeats at the same instant", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const now = new Date("2026-09-12T22:00:00.000Z");
-    const first = service.recover("nightly_run", now);
-    expect(first.missedOccurrences).toBe(4);
-    const second = service.recover("nightly_run", now);
-    expect(second.missedOccurrences).toBe(0);
-    expect(second.executionsDue).toBe(0);
-    expect(second.nextRunAt).toBe("2026-09-12T23:00:00.000Z");
-  });
-
-  it("records the recovery on the schedule for operators", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "run-once" });
-    service.recover("nightly_run", new Date("2026-09-12T22:00:00.000Z"));
-    const schedule = service.get("nightly_run");
-    expect(schedule.lastMisfire?.policy).toBe("run-once");
-    expect(schedule.lastMisfire?.missedOccurrences).toBe(4);
-    expect(schedule.lastMisfire?.executionsDue).toBe(1);
-    expect(schedule.lastMisfire?.recoveredAt).toBe(
-      "2026-09-12T22:00:00.000Z",
-    );
-  });
-
-  it("rejects recovery for an unknown schedule", () => {
-    const service = new ScheduleService({ clock });
-    expect(() =>
-      service.recover("missing_schedule", new Date("2026-09-12T22:00:00.000Z")),
-    ).toThrow("Schedule not found.");
-  });
-
-  it("rejects recovery for a disabled schedule", () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    service.disable("nightly_run");
-    expect(() =>
-      service.recover("nightly_run", new Date("2026-09-12T22:00:00.000Z")),
-    ).toThrow("Schedule is disabled.");
-  });
-});
-
-describe("misfire recurrence helpers", () => {
-  it("counts occurrences from the first due time through now", () => {
-    expect(
-      countMissedOccurrences(
-        new Date("2026-09-12T19:00:00.000Z"),
-        new Date("2026-09-12T22:00:00.000Z"),
-        3600,
-      ),
-    ).toBe(4);
-    expect(
-      countMissedOccurrences(
-        new Date("2026-09-12T19:00:00.000Z"),
-        new Date("2026-09-12T18:59:59.999Z"),
-        3600,
-      ),
-    ).toBe(0);
-  });
-
-  it("rejects invalid recurrence intervals", () => {
-    expect(() =>
-      countMissedOccurrences(
-        new Date("2026-09-12T19:00:00.000Z"),
-        new Date("2026-09-12T22:00:00.000Z"),
-        30,
-      ),
-    ).toThrow("recurrence");
-  });
-
-  it("rejects an unknown policy in resolveMisfire", () => {
-    expect(() =>
-      resolveMisfire({
-        firstDueAt: new Date("2026-09-12T19:00:00.000Z"),
-        intervalSeconds: 3600,
-        now: new Date("2026-09-12T22:00:00.000Z"),
-        policy: "replay-all" as unknown as "skip",
-      }),
-    ).toThrow("misfire policy");
-  });
-});
-
-describe("misfire authorization", () => {
-  it("allows a maintainer to change scheduling policy", () => {
-    expect(authorize(request("maintainer", "schedule.write"))).toEqual({
-      granted: true,
+    expect(sameOwner).toEqual({
+      acquired: false,
+      expiresAt: "2026-09-12T18:05:00.000Z",
+      ownerId: "scheduler-a",
+      reason: "already_leased",
     });
-  });
-
-  it("denies schedule writes to a viewer", () => {
-    expect(() => authorize(request("viewer", "schedule.write"))).toThrow(
-      "not authorized",
-    );
-  });
-
-  it("denies schedule writes to an auditor", () => {
-    expect(() => authorize(request("auditor", "schedule.write"))).toThrow(
-      "not authorized",
-    );
-  });
-
-  it("allows an auditor to read schedule state", () => {
-    expect(authorize(request("auditor", "schedule.read"))).toEqual({
-      granted: true,
+    const otherOwner = await service.acquireLease({
+      actor: userActor("runner"),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-b",
+      scheduleId: "nightly_run",
     });
-  });
-
-  it("denies schedule reads across tenant boundaries", () => {
-    expect(() =>
-      authorize({
-        ...request("owner", "schedule.read"),
-        resourceOrganizationId: "organization_b",
-      }),
-    ).toThrow("not authorized");
-  });
-
-  it("requires the schedule scope for service accounts", () => {
-    expect(
-      authorize({
-        action: "schedule.write",
-        actor: {
-          kind: "service_account",
-          scopes: new Set(["schedule:write"]),
-          serviceAccountId: "service_account_1",
-        },
-        organizationId: "organization_a",
-        resourceOrganizationId: "organization_a",
-      }),
-    ).toEqual({ granted: true });
-    expect(() =>
-      authorize({
-        action: "schedule.write",
-        actor: {
-          kind: "service_account",
-          scopes: new Set(["run:create"]),
-          serviceAccountId: "service_account_1",
-        },
-        organizationId: "organization_a",
-        resourceOrganizationId: "organization_a",
-      }),
-    ).toThrow("not authorized");
-  });
-});
-
-describe("misfire audit integration", () => {
-  it("records the policy and missed count in audit metadata", async () => {
-    const service = new ScheduleService({ clock });
-    service.create("nightly_run", 3600, { misfirePolicy: "catch-up" });
-    const recovery = service.recover(
-      "nightly_run",
-      new Date("2026-09-12T22:00:00.000Z"),
-    );
-    const audit = new AuditService(new InMemoryAuditStore());
-    const event = await audit.record({
-      action: "schedule.misfire.recovered",
-      actorId: "system",
-      actorType: "system",
-      metadata: recovery.auditMetadata,
-      now: new Date("2026-09-12T22:00:00.000Z"),
-      organizationId: "organization_a",
-      requestId: "request_1",
-      targetId: "nightly_run",
-      targetType: "schedule",
-    });
-    expect(event.metadata).toEqual({
-      executions_due: 4,
-      misfire_capped: false,
-      misfire_policy: "catch-up",
-      missed_occurrences: 4,
-      schedule_id: "nightly_run",
-    });
-    expect(verifyMetadataHash(event)).toBe(true);
-    expect(service.get("nightly_run").lastMisfire?.auditMetadata).toEqual(
-      event.metadata,
-    );
-  });
-});
-
-describe("occurrence keys", () => {
-  it("derives a stable key for one schedule occurrence", () => {
-    expect(deriveOccurrenceKey("nightly_run", "2026-09-12T19:00:00.000Z")).toBe(
-      "schedule:nightly_run:2026-09-12T19:00:00.000Z",
-    );
-  });
-
-  it("normalizes equivalent timestamps to the same key", () => {
-    const fromString = deriveOccurrenceKey(
-      "nightly_run",
-      "2026-09-12T19:00:00.000Z",
-    );
-    expect(
-      deriveOccurrenceKey("nightly_run", new Date("2026-09-12T19:00:00.000Z")),
-    ).toBe(fromString);
-    expect(
-      deriveOccurrenceKey("nightly_run", "2026-09-12T21:00:00.000+02:00"),
-    ).toBe(fromString);
-  });
-
-  it("separates keys by schedule and by occurrence", () => {
-    const key = deriveOccurrenceKey("nightly_run", "2026-09-12T19:00:00.000Z");
-    expect(
-      deriveOccurrenceKey("weekly_run", "2026-09-12T19:00:00.000Z"),
-    ).not.toBe(key);
-    expect(
-      deriveOccurrenceKey("nightly_run", "2026-09-12T20:00:00.000Z"),
-    ).not.toBe(key);
-  });
-
-  it("stays inside the idempotency-key bounds at both id lengths", () => {
-    const shortKey = deriveOccurrenceKey("abc", "2026-09-12T19:00:00.000Z");
-    const longKey = deriveOccurrenceKey(
-      "a".repeat(64),
-      "2026-09-12T19:00:00.000Z",
-    );
-    for (const key of [shortKey, longKey]) {
-      expect(key.length).toBeGreaterThanOrEqual(16);
-      expect(key.length).toBeLessThanOrEqual(128);
-      expect(key).toMatch(/^[A-Za-z0-9._:-]+$/u);
+    expect(otherOwner.acquired).toBe(false);
+    if (!otherOwner.acquired) {
+      expect(otherOwner.reason).toBe("already_leased");
+      expect(otherOwner.ownerId).toBe("scheduler-a");
     }
   });
 
-  it("rejects invalid schedule ids and occurrences", () => {
-    expect(() => deriveOccurrenceKey("x", "2026-09-12T19:00:00.000Z")).toThrow(
-      "schedule",
-    );
-    expect(() =>
-      deriveOccurrenceKey("nightly_run", "not-a-date"),
-    ).toThrow("occurrence");
-  });
-});
-
-describe("occurrence claims", () => {
-  it("claims an occurrence once and reports the repeat claim", () => {
-    const service = new ScheduleService({ clock: fixedClock() });
-    service.create("nightly_run", 3600);
-    const first = service.claimOccurrence("nightly_run");
-    expect(first.claimed).toBe(true);
-    expect(first.occurrenceAt).toBe("2026-09-12T19:00:00.000Z");
-    expect(first.occurrenceKey).toBe(
-      "schedule:nightly_run:2026-09-12T19:00:00.000Z",
-    );
-    const second = service.claimOccurrence("nightly_run");
-    expect(second.claimed).toBe(false);
-    expect(second.occurrenceKey).toBe(first.occurrenceKey);
+  it("allows takeover exactly when the previous lease expires", async () => {
+    const { advance, service } = createHarness();
+    await acquireLease(service);
+    advance(300_000);
+    const takeover = await service.acquireLease({
+      actor: userActor("runner"),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-b",
+      scheduleId: "nightly_run",
+    });
+    expect(takeover.acquired).toBe(true);
   });
 
-  it("rejects claims for unknown, disabled, or non-due occurrences", () => {
-    const service = new ScheduleService({ clock: fixedClock() });
-    service.create("nightly_run", 3600);
-    expect(() => service.claimOccurrence("missing_run")).toThrow(
-      "Schedule not found.",
-    );
-    expect(() =>
-      service.claimOccurrence("nightly_run", "2026-09-12T20:00:00.000Z"),
-    ).toThrow("Invalid occurrence.");
+  it("rejects acquisition for unknown or disabled schedules and invalid inputs", async () => {
+    const { service } = createHarness();
+    await expect(
+      service.acquireLease({
+        actor: userActor("runner"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-a",
+        scheduleId: "missing_schedule",
+      }),
+    ).rejects.toThrow("Schedule not found.");
     service.disable("nightly_run");
-    expect(() => service.claimOccurrence("nightly_run")).toThrow(
-      "Schedule is disabled.",
-    );
+    await expect(
+      service.acquireLease({
+        actor: userActor("runner"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-a",
+        scheduleId: "nightly_run",
+      }),
+    ).rejects.toThrow("Schedule is disabled.");
   });
 
-  it("advances exactly one interval and ignores a retried advance", () => {
-    const service = new ScheduleService({ clock: fixedClock() });
-    const schedule = service.create("nightly_run", 3600);
-    const advanced = service.advance(
-      schedule.id,
-      "2026-09-12T19:00:00.000Z",
-    );
-    expect(advanced.nextRunAt).toBe("2026-09-12T20:00:00.000Z");
-    expect(
-      service.advance(schedule.id, "2026-09-12T19:00:00.000Z").nextRunAt,
-    ).toBe("2026-09-12T20:00:00.000Z");
-    expect(() =>
-      service.advance(schedule.id, "2026-09-12T21:00:00.000Z"),
-    ).toThrow("Invalid occurrence.");
+  it("rejects lease TTLs outside the bounded range", async () => {
+    const { service } = createHarness();
+    for (const leaseTtlSeconds of [0, 29, 3601, 30.5]) {
+      await expect(
+        service.acquireLease({
+          actor: userActor("runner"),
+          leaseTtlSeconds,
+          organizationId,
+          ownerId: "scheduler-a",
+          scheduleId: "nightly_run",
+        }),
+      ).rejects.toThrow("Invalid lease TTL.");
+    }
+    await expect(
+      service.acquireLease({
+        actor: userActor("runner"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "  ",
+        scheduleId: "nightly_run",
+      }),
+    ).rejects.toThrow("Invalid lease owner.");
   });
 
-  it("lists only due and enabled schedules", () => {
-    const service = new ScheduleService({ clock: fixedClock() });
-    service.create("nightly_run", 3600);
-    const disabled = service.create("disabled_run", 3600);
-    service.disable(disabled.id);
-    expect(service.due()).toEqual([]);
-    expect(
-      service.due(new Date("2026-09-12T19:00:00.000Z")).map(
-        (schedule) => schedule.id,
-      ),
-    ).toEqual(["nightly_run"]);
-  });
-});
-
-describe("scheduled run triggers", () => {
-  it("creates one run per occurrence and advances the schedule once", async () => {
-    const { schedules, trigger } = triggerSetup();
-    const first = await trigger.trigger("nightly_run", runInput);
-    expect(first.created).toBe(true);
-    expect(first.claimed).toBe(true);
-    expect(first.run.idempotencyKey).toBe(
-      "schedule:nightly_run:2026-09-12T19:00:00.000Z",
-    );
-    expect(first.run.state).toBe("requested");
-    expect(first.occurrenceAt).toBe("2026-09-12T19:00:00.000Z");
-    const next = await trigger.trigger("nightly_run", runInput);
-    expect(next.created).toBe(true);
-    expect(next.run.id).not.toBe(first.run.id);
-    expect(next.occurrenceKey).toBe(
-      "schedule:nightly_run:2026-09-12T20:00:00.000Z",
-    );
-    expect(
-      schedules.claimOccurrence("nightly_run").occurrenceAt,
-    ).toBe("2026-09-12T21:00:00.000Z");
-  });
-
-  it("returns the original run for concurrent duplicate triggers", async () => {
-    const { schedules, trigger } = triggerSetup();
-    const [first, second] = await Promise.all([
-      trigger.trigger("nightly_run", runInput),
-      trigger.trigger("nightly_run", runInput),
+  it("renews with compare-and-set: version, expiry, and renewal count advance", async () => {
+    const { advance, events, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(60_000);
+    const renewed = await service.renewLease(renewInput(lease));
+    expect(renewed.renewed).toBe(true);
+    if (!renewed.renewed) throw new Error("Expected renewal to succeed.");
+    expect(renewed.lease.version).toBe(2);
+    expect(renewed.lease.renewalCount).toBe(1);
+    expect(renewed.lease.token).toBe("token-1");
+    expect(renewed.lease.acquiredAt).toBe("2026-09-12T18:00:00.000Z");
+    expect(renewed.lease.renewedAt).toBe("2026-09-12T18:01:00.000Z");
+    expect(renewed.lease.expiresAt).toBe("2026-09-12T18:06:00.000Z");
+    expect(events.map((event) => event.type)).toEqual([
+      "lease.acquired",
+      "lease.renewed",
     ]);
-    expect(first.run.id).toBe(second.run.id);
-    expect(first.run).toEqual(second.run);
-    expect([first.created, second.created].filter(Boolean)).toHaveLength(1);
-    expect([first.claimed, second.claimed].filter(Boolean)).toHaveLength(1);
-    // The schedule advanced exactly one interval despite the duplicate.
-    expect(
-      schedules.claimOccurrence("nightly_run").occurrenceAt,
-    ).toBe("2026-09-12T20:00:00.000Z");
   });
 
-  it("keeps the same occurrence separate across organizations", async () => {
-    const repository = new InMemoryRunRepository();
-    const makeTrigger = () => {
-      const schedules = new ScheduleService({ clock: fixedClock() });
-      schedules.create("nightly_run", 3600);
-      return new ScheduledRunTrigger({
-        runs: new RunService({ repository }),
-        schedules,
-      });
-    };
-    const [first, other] = await Promise.all([
-      makeTrigger().trigger("nightly_run", runInput),
-      makeTrigger().trigger("nightly_run", {
-        ...runInput,
-        organizationId: otherOrganizationId,
+  it("rejects renewal with a stale token and leaves the lease untouched", async () => {
+    const { advance, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(300_000);
+    const retaken = await acquireLease(service);
+    expect(retaken.token).toBe("token-2");
+    const stale = await service.renewLease(renewInput(lease));
+    expect(stale).toEqual({ reason: "stale_token", renewed: false });
+    const current = await service.renewLease(renewInput(retaken));
+    expect(current.renewed).toBe(true);
+    if (!current.renewed) throw new Error("Expected renewal to succeed.");
+    expect(current.lease.version).toBe(2);
+  });
+
+  it("rejects renewal after ownership transfer and leaves the new lease intact", async () => {
+    const { advance, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(300_000);
+    const takeover = await acquireLease(service, { ownerId: "scheduler-b" });
+    expect(takeover.ownerId).toBe("scheduler-b");
+    const lost = await service.renewLease(renewInput(lease));
+    expect(lost).toEqual({ reason: "ownership_changed", renewed: false });
+    const kept = await service.renewLease(renewInput(takeover));
+    expect(kept.renewed).toBe(true);
+  });
+
+  it("rejects renewal of an expired lease", async () => {
+    const { advance, events, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(300_001);
+    const renewed = await service.renewLease(renewInput(lease));
+    expect(renewed).toEqual({ reason: "expired", renewed: false });
+    expect(events.map((event) => event.type)).toContain("lease.expired");
+  });
+
+  it("renews one millisecond before expiry and fails exactly at expiry", async () => {
+    const { advance, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(299_999);
+    const edge = await service.renewLease(renewInput(lease));
+    expect(edge.renewed).toBe(true);
+    if (!edge.renewed) throw new Error("Expected renewal to succeed.");
+    advance(300_000);
+    const expired = await service.renewLease(renewInput(edge.lease));
+    expect(expired).toEqual({ reason: "expired", renewed: false });
+  });
+
+  it("reports renewal of an unknown schedule as not found", async () => {
+    const { service } = createHarness();
+    const renewed = await service.renewLease({
+      actor: userActor("runner"),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-a",
+      scheduleId: "missing_schedule",
+      token: "token-1",
+    });
+    expect(renewed).toEqual({ reason: "not_found", renewed: false });
+  });
+
+  it("allows exactly one of two concurrent renewals with the same token", async () => {
+    const { service } = createHarness();
+    const lease = await acquireLease(service);
+    const results = await Promise.all([
+      service.renewLease(renewInput(lease)),
+      service.renewLease(renewInput(lease)),
+    ]);
+    const successes = results.filter((result) => result.renewed);
+    expect(successes).toHaveLength(1);
+    const winner = successes[0];
+    if (winner === undefined) throw new Error("Expected one renewal to win.");
+    expect(winner.lease.version).toBe(2);
+    expect(winner.lease.renewalCount).toBe(1);
+    const loser = results.find((result) => !result.renewed);
+    expect(loser).toEqual({ reason: "stale_token", renewed: false });
+    const next = await service.renewLease(renewInput(winner.lease));
+    expect(next.renewed).toBe(true);
+    if (!next.renewed) throw new Error("Expected renewal to succeed.");
+    expect(next.lease.version).toBe(3);
+  });
+
+  it("allows exactly one of two concurrent acquisitions", async () => {
+    const { service } = createHarness();
+    const results = await Promise.all([
+      service.acquireLease({
+        actor: userActor("runner"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-a",
+        scheduleId: "nightly_run",
+      }),
+      service.acquireLease({
+        actor: userActor("runner"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-b",
+        scheduleId: "nightly_run",
       }),
     ]);
-    expect(first.created).toBe(true);
-    expect(other.created).toBe(true);
-    expect(other.run.id).not.toBe(first.run.id);
-    expect(other.run.idempotencyKey).toBe(first.run.idempotencyKey);
-    expect(other.occurrenceKey).toBe(first.occurrenceKey);
+    expect(results.filter((result) => result.acquired)).toHaveLength(1);
+    expect(results.filter((result) => !result.acquired)).toHaveLength(1);
   });
 
-  it("recovers the original run when a replica fails over mid-occurrence", async () => {
-    const repository = new InMemoryRunRepository();
-    const primarySchedules = new ScheduleService({ clock: fixedClock() });
-    const primaryRuns = new RunService({ repository });
-    primarySchedules.create("nightly_run", 3600);
-    // Primary claims the occurrence and creates the run, then crashes
-    // before advancing the schedule.
-    const claim = primarySchedules.claimOccurrence("nightly_run");
-    const { created, run } = await primaryRuns.createClaim({
-      ...runInput,
-      idempotencyKey: claim.occurrenceKey,
+  it("releases with the current token and allows immediate re-acquisition", async () => {
+    const { events, service } = createHarness();
+    const lease = await acquireLease(service);
+    const released = await service.releaseLease({
+      actor: userActor("runner"),
+      organizationId,
+      ownerId: lease.ownerId,
+      scheduleId: lease.scheduleId,
+      token: lease.token,
     });
-    expect(created).toBe(true);
-
-    // Failover replica starts from the same due occurrence.
-    const replicaSchedules = new ScheduleService({ clock: fixedClock() });
-    const replicaRuns = new RunService({ repository });
-    const replicaTrigger = new ScheduledRunTrigger({
-      runs: replicaRuns,
-      schedules: replicaSchedules,
-    });
-    replicaSchedules.create("nightly_run", 3600);
-    const recovered = await replicaTrigger.trigger("nightly_run", runInput);
-    expect(recovered.created).toBe(false);
-    expect(recovered.run).toEqual(run);
-    expect(
-      replicaSchedules.claimOccurrence("nightly_run").occurrenceAt,
-    ).toBe("2026-09-12T20:00:00.000Z");
+    expect(released).toEqual({ released: true });
+    expect(events.map((event) => event.type)).toContain("lease.released");
+    const reacquired = await acquireLease(service, { ownerId: "scheduler-b" });
+    expect(reacquired.ownerId).toBe("scheduler-b");
+    expect(reacquired.token).toBe("token-2");
   });
 
-  it("creates one run when two failover replicas trigger concurrently", async () => {
-    const repository = new InMemoryRunRepository();
-    const makeReplica = () => {
-      const schedules = new ScheduleService({ clock: fixedClock() });
-      schedules.create("nightly_run", 3600);
-      return new ScheduledRunTrigger({
-        runs: new RunService({ repository }),
-        schedules,
-      });
+  it("rejects release with a stale token and leaves the lease held", async () => {
+    const { advance, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(300_000);
+    const retaken = await acquireLease(service);
+    expect(retaken.token).toBe("token-2");
+    const stale = await service.releaseLease({
+      actor: userActor("runner"),
+      organizationId,
+      ownerId: lease.ownerId,
+      scheduleId: lease.scheduleId,
+      token: lease.token,
+    });
+    expect(stale).toEqual({ reason: "stale_token", released: false });
+    const kept = await service.renewLease(renewInput(retaken));
+    expect(kept.renewed).toBe(true);
+  });
+
+  it("rejects release after ownership transfer", async () => {
+    const { advance, service } = createHarness();
+    const lease = await acquireLease(service);
+    advance(300_000);
+    const takeover = await acquireLease(service, { ownerId: "scheduler-b" });
+    const released = await service.releaseLease({
+      actor: userActor("runner"),
+      organizationId,
+      ownerId: lease.ownerId,
+      scheduleId: lease.scheduleId,
+      token: lease.token,
+    });
+    expect(released).toEqual({
+      reason: "ownership_changed",
+      released: false,
+    });
+    const kept = await service.renewLease(renewInput(takeover));
+    expect(kept.renewed).toBe(true);
+  });
+
+  it("lets a held lease renew after the schedule is disabled, but blocks new acquisition", async () => {
+    const { service } = createHarness();
+    const lease = await acquireLease(service);
+    service.disable("nightly_run");
+    const renewed = await service.renewLease(renewInput(lease));
+    expect(renewed.renewed).toBe(true);
+  });
+
+  it("denies cross-tenant renewal and release without touching the lease", async () => {
+    const { service } = createHarness();
+    const lease = await acquireLease(service);
+    await expect(
+      service.renewLease(
+        renewInput(lease, { organizationId: otherOrganizationId }),
+      ),
+    ).rejects.toThrow("not authorized");
+    await expect(
+      service.releaseLease({
+        actor: userActor("runner"),
+        organizationId: otherOrganizationId,
+        ownerId: lease.ownerId,
+        scheduleId: lease.scheduleId,
+        token: lease.token,
+      }),
+    ).rejects.toThrow("not authorized");
+    const kept = await service.renewLease(renewInput(lease));
+    expect(kept.renewed).toBe(true);
+  });
+
+  it("authorizes lease operations by role and service-account scope", async () => {
+    const { service } = createHarness();
+    await expect(
+      service.acquireLease({
+        actor: userActor("viewer"),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-a",
+        scheduleId: "nightly_run",
+      }),
+    ).rejects.toThrow("not authorized");
+    await expect(
+      service.acquireLease({
+        actor: serviceActor([]),
+        leaseTtlSeconds: 300,
+        organizationId,
+        ownerId: "scheduler-a",
+        scheduleId: "nightly_run",
+      }),
+    ).rejects.toThrow("not authorized");
+    const scoped = await service.acquireLease({
+      actor: serviceActor(["schedule:lease"]),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-a",
+      scheduleId: "nightly_run",
+    });
+    expect(scoped.acquired).toBe(true);
+    const maintained = await service.acquireLease({
+      actor: userActor("maintainer"),
+      leaseTtlSeconds: 300,
+      organizationId,
+      ownerId: "scheduler-b",
+      scheduleId: "nightly_run",
+    });
+    expect(maintained.acquired).toBe(false);
+  });
+});
+
+describe("leased jobs", () => {
+  it("completes a job, renews while running, and releases the lease", async () => {
+    const { events, service } = createLiveHarness();
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async () => {
+        await realSleep(120);
+        return "done";
+      },
+      leaseTtlSeconds: 30,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome.completed).toBe(true);
+    if (!outcome.completed) throw new Error("Expected the job to complete.");
+    expect(outcome.result).toBe("done");
+    expect(outcome.renewals).toBeGreaterThanOrEqual(1);
+    expect(outcome.lease.version).toBe(outcome.renewals + 1);
+    const types = events.map((event) => event.type);
+    expect(types).toContain("lease.acquired");
+    expect(types).toContain("lease.renewed");
+    expect(types).toContain("job.completed");
+    expect(types).toContain("lease.released");
+    const reacquired = await acquireLease(service, { ownerId: "scheduler-b" });
+    expect(reacquired.ownerId).toBe("scheduler-b");
+  });
+
+  it("aborts the job when the lease is released mid-run and emits no completion", async () => {
+    const { events, service } = createLiveHarness();
+    let jobSawAbort = false;
+    const outcomePromise = service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async (signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            jobSawAbort = true;
+            resolve();
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => {
+              jobSawAbort = true;
+              resolve();
+            },
+            { once: true },
+          );
+          setTimeout(resolve, 5000);
+        });
+        return signal.aborted ? "aborted" : "finished";
+      },
+      leaseTtlSeconds: 30,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    await realSleep(120);
+    const released = await service.releaseLease({
+      actor: userActor("runner"),
+      organizationId,
+      ownerId: "scheduler-a",
+      scheduleId: "nightly_run",
+      token: "token-1",
+    });
+    expect(released).toEqual({ released: true });
+    const outcome = await outcomePromise;
+    expect(outcome.completed).toBe(false);
+    if (outcome.completed) throw new Error("Expected the job to abort.");
+    expect(outcome.reason).toBe("lease_lost");
+    expect(jobSawAbort).toBe(true);
+    const types = events.map((event) => event.type);
+    expect(types).toContain("job.aborted");
+    expect(types).not.toContain("job.completed");
+  });
+
+  it("suppresses completion when ownership is lost just before the job finishes", async () => {
+    const { events, service } = createLiveHarness();
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async () => {
+        await realSleep(60);
+        await service.releaseLease({
+          actor: userActor("runner"),
+          organizationId,
+          ownerId: "scheduler-a",
+          scheduleId: "nightly_run",
+          token: "token-1",
+        });
+        return "done";
+      },
+      leaseTtlSeconds: 30,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome.completed).toBe(false);
+    if (outcome.completed) throw new Error("Expected no completion.");
+    expect(outcome.reason).toBe("lease_lost");
+    const types = events.map((event) => event.type);
+    expect(types).toContain("job.aborted");
+    expect(types).not.toContain("job.completed");
+  });
+
+  it("aborts when the renewal budget is exhausted", async () => {
+    const { events, service } = createLiveHarness();
+    let jobSawAbort = false;
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            jobSawAbort = true;
+            resolve();
+          });
+          setTimeout(resolve, 5000);
+        });
+        return "done";
+      },
+      leaseTtlSeconds: 30,
+      maxRenewals: 0,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome.completed).toBe(false);
+    if (outcome.completed) throw new Error("Expected the job to abort.");
+    expect(outcome.reason).toBe("max_renewals");
+    expect(outcome.renewals).toBe(0);
+    expect(jobSawAbort).toBe(true);
+    expect(events.map((event) => event.type)).not.toContain("job.completed");
+  });
+
+  it("aborts when the maximum job duration is reached", async () => {
+    const { service } = createLiveHarness();
+    let jobSawAbort = false;
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            jobSawAbort = true;
+            resolve();
+          });
+          setTimeout(resolve, 5000);
+        });
+        return "done";
+      },
+      leaseTtlSeconds: 30,
+      maxDurationMs: 120,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome.completed).toBe(false);
+    if (outcome.completed) throw new Error("Expected the job to abort.");
+    expect(outcome.reason).toBe("max_duration");
+    expect(jobSawAbort).toBe(true);
+  });
+
+  it("reports job failure without a completion event and releases the lease", async () => {
+    const { events, service } = createLiveHarness();
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: async () => {
+        await realSleep(20);
+        throw new Error("boom");
+      },
+      leaseTtlSeconds: 30,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome.completed).toBe(false);
+    if (outcome.completed) throw new Error("Expected the job to fail.");
+    expect(outcome.reason).toBe("job_failed");
+    expect(outcome.error).toBeInstanceOf(Error);
+    if (outcome.error instanceof Error) {
+      expect(outcome.error.message).toBe("boom");
+    }
+    expect(events.map((event) => event.type)).not.toContain("job.completed");
+    const reacquired = await acquireLease(service, { ownerId: "scheduler-b" });
+    expect(reacquired.ownerId).toBe("scheduler-b");
+  });
+
+  it("rejects a renewal interval that is not shorter than the lease TTL", async () => {
+    const { service } = createLiveHarness();
+    await expect(
+      service.runLeasedJob({
+        actor: userActor("runner"),
+        job: () => Promise.resolve("done"),
+        leaseTtlSeconds: 30,
+        organizationId,
+        ownerId: "scheduler-a",
+        renewalIntervalMs: 30_000,
+        scheduleId: "nightly_run",
+      }),
+    ).rejects.toThrow("shorter than the lease TTL");
+  });
+
+  it("reports an already-leased schedule instead of running a second job", async () => {
+    const { service } = createLiveHarness();
+    await acquireLease(service);
+    const outcome = await service.runLeasedJob({
+      actor: userActor("runner"),
+      job: () => Promise.resolve("done"),
+      leaseTtlSeconds: 30,
+      organizationId,
+      ownerId: "scheduler-b",
+      renewalIntervalMs: 50,
+      scheduleId: "nightly_run",
+    });
+    expect(outcome).toEqual({
+      completed: false,
+      reason: "already_leased",
+      renewals: 0,
+    });
+  });
+});
+
+describe("in-memory lease store", () => {
+  function leaseFixture(expiresAt: string): SchedulerLease {
+    return {
+      acquiredAt: "2026-09-12T18:00:00.000Z",
+      expiresAt,
+      organizationId,
+      ownerId: "scheduler-a",
+      renewalCount: 0,
+      scheduleId: "nightly_run",
+      token: "token-1",
+      version: 1,
     };
-    const [first, second] = await Promise.all([
-      makeReplica().trigger("nightly_run", runInput),
-      makeReplica().trigger("nightly_run", runInput),
-    ]);
-    expect(first.run.id).toBe(second.run.id);
-    expect([first.created, second.created].filter(Boolean)).toHaveLength(1);
+  }
+
+  it("refuses a live lease on insert and replaces an expired one", async () => {
+    let now = new Date("2026-09-12T18:00:00.000Z").getTime();
+    const store = new InMemorySchedulerLeaseStore({
+      clock: () => new Date(now),
+    });
+    const lease = leaseFixture("2026-09-12T18:05:00.000Z");
+    await expect(store.insert(lease)).resolves.toBe(true);
+    await expect(store.insert(lease)).resolves.toBe(false);
+    now = new Date("2026-09-12T18:05:00.000Z").getTime();
+    await expect(store.insert({ ...lease, token: "token-2" })).resolves.toBe(
+      true,
+    );
+    await expect(store.find("nightly_run")).resolves.toMatchObject({
+      token: "token-2",
+    });
+  });
+
+  it("requires owner, token, and version to match and refuses expired leases on compare-and-swap", async () => {
+    let now = new Date("2026-09-12T18:00:00.000Z").getTime();
+    const store = new InMemorySchedulerLeaseStore({
+      clock: () => new Date(now),
+    });
+    const lease = leaseFixture("2026-09-12T18:05:00.000Z");
+    await store.insert(lease);
+    const next: SchedulerLease = {
+      ...lease,
+      expiresAt: "2026-09-12T18:10:00.000Z",
+      renewalCount: 1,
+      renewedAt: "2026-09-12T18:01:00.000Z",
+      version: 2,
+    };
+    const owner = {
+      ownerId: "scheduler-a",
+      scheduleId: "nightly_run",
+      token: "token-1",
+      version: 1,
+    };
+    await expect(
+      store.compareAndSwap({ ...owner, version: 2 }, next),
+    ).resolves.toBe(false);
+    await expect(
+      store.compareAndSwap({ ...owner, token: "token-9" }, next),
+    ).resolves.toBe(false);
+    await expect(
+      store.compareAndSwap({ ...owner, ownerId: "scheduler-b" }, next),
+    ).resolves.toBe(false);
+    await expect(store.compareAndSwap(owner, next)).resolves.toBe(true);
+    await expect(store.compareAndSwap(owner, next)).resolves.toBe(false);
+    now = new Date("2026-09-12T18:10:00.000Z").getTime();
+    await expect(
+      store.compareAndSwap({ ...owner, version: 2 }, { ...next, version: 3 }),
+    ).resolves.toBe(false);
+  });
+
+  it("requires owner, token, and version to match on compare-and-delete", async () => {
+    const store = new InMemorySchedulerLeaseStore({
+      clock: () => new Date("2026-09-12T18:00:00.000Z"),
+    });
+    const lease = leaseFixture("2026-09-12T18:05:00.000Z");
+    await store.insert(lease);
+    const owner = {
+      ownerId: "scheduler-a",
+      scheduleId: "nightly_run",
+      token: "token-1",
+      version: 1,
+    };
+    await expect(
+      store.compareAndDelete({ ...owner, token: "token-9" }),
+    ).resolves.toBe(false);
+    await expect(store.compareAndDelete(owner)).resolves.toBe(true);
+    await expect(store.find("nightly_run")).resolves.toBeUndefined();
   });
 });

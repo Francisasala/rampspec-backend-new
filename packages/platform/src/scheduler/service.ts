@@ -15,9 +15,7 @@ export {
 } from "./recurrence.js";
 
 export interface MisfireRecord {
-  readonly auditMetadata: Readonly<
-    Record<string, boolean | number | string>
-  >;
+  readonly auditMetadata: Readonly<Record<string, boolean | number | string>>;
   readonly capped: boolean;
   readonly executionsDue: number;
   readonly missedOccurrences: number;
@@ -36,9 +34,7 @@ export interface Schedule {
 }
 
 export interface MisfireRecovery {
-  readonly auditMetadata: Readonly<
-    Record<string, boolean | number | string>
-  >;
+  readonly auditMetadata: Readonly<Record<string, boolean | number | string>>;
   readonly capped: boolean;
   readonly executionsDue: number;
   readonly missedOccurrences: number;
@@ -71,7 +67,8 @@ export function deriveOccurrenceKey(
   if (!scheduleIdPattern.test(scheduleId)) throw new Error("Invalid schedule.");
   const occurrence =
     occurrenceAt instanceof Date ? occurrenceAt : new Date(occurrenceAt);
-  if (Number.isNaN(occurrence.getTime())) throw new Error("Invalid occurrence.");
+  if (Number.isNaN(occurrence.getTime()))
+    throw new Error("Invalid occurrence.");
   return `schedule:${scheduleId}:${occurrence.toISOString()}`;
 }
 
@@ -309,7 +306,8 @@ export class ScheduleService {
 function canonicalOccurrence(occurrenceAt: string | Date): string {
   const occurrence =
     occurrenceAt instanceof Date ? occurrenceAt : new Date(occurrenceAt);
-  if (Number.isNaN(occurrence.getTime())) throw new Error("Invalid occurrence.");
+  if (Number.isNaN(occurrence.getTime()))
+    throw new Error("Invalid occurrence.");
   return occurrence.toISOString();
 }
 

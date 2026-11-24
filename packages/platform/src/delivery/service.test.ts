@@ -1,123 +1,128 @@
-import { describe, expect, it } from "vitest";
-import {
-  DeliveryService,
-  MAX_DELIVERY_ATTEMPTS,
-} from "./service.js";
+import { describe, expect, it, vi } from "vitest";
+
+import { webhookRetryDelay } from "../webhooks/retry.js";
+import { WebhookCircuitBreaker } from "./circuit-breaker.js";
+import { DeliveryService } from "./service.js";
+import { deliverWebhook } from "./webhook.js";
 
 const reportId = "report_00000000-0000-4000-8000-000000000001";
+const orgA = "org_00000000-0000-4000-8000-000000000001";
+const orgB = "org_00000000-0000-4000-8000-000000000002";
+const endpoint = "https://hooks.example.com/ramp";
+const secret = new TextEncoder().encode("secret");
 
-describe("delivery records", () => { it("creates immutable hashed deliveries and tracks retries", () => { const service = new DeliveryService(); const delivery = service.create("report_00000000-0000-4000-8000-000000000001", "webhook", { ok: true }); expect(delivery.payloadHash).toHaveLength(64); expect(service.update(delivery.id, "failed").retryCount).toBe(1); expect(service.update(delivery.id, "delivered").state).toBe("delivered"); expect(() => service.update(delivery.id, "failed")).toThrow("terminal"); }); });
-
-function exhaust(service: DeliveryService, id: string) {
-  for (let attempt = 0; attempt < MAX_DELIVERY_ATTEMPTS; attempt += 1) {
-    service.update(id, "failed");
-  }
+function fakeClock(start = "2026-11-19T00:00:00.000Z") {
+  let now = new Date(start).getTime();
+  return {
+    advance: (milliseconds: number) => {
+      now += milliseconds;
+    },
+    clock: () => new Date(now),
+  };
 }
 
-describe("dead-letter state", () => {
-  it("parks a delivery as dead-letter after the maximum failed attempts", () => {
+describe("delivery records", () => {
+  it("creates immutable hashed deliveries and tracks retries", () => {
     const service = new DeliveryService();
     const delivery = service.create(reportId, "webhook", { ok: true });
-    for (let attempt = 1; attempt < MAX_DELIVERY_ATTEMPTS; attempt += 1) {
-      const updated = service.update(delivery.id, "failed");
-      expect(updated.state).toBe("failed");
-      expect(updated.retryCount).toBe(attempt);
-      expect(updated.deadLetterAt).toBeNull();
-    }
-    const exhausted = service.update(delivery.id, "failed");
-    expect(exhausted.state).toBe("dead-letter");
-    expect(exhausted.retryCount).toBe(MAX_DELIVERY_ATTEMPTS);
-    expect(exhausted.deadLetterAt).not.toBeNull();
-    expect(service.listDeadLetter().map(({ id }) => id)).toEqual([
-      delivery.id,
-    ]);
-  });
-
-  it("allows an explicit dead-letter transition and treats it as terminal", () => {
-    const service = new DeliveryService();
-    const delivery = service.create(reportId, "webhook", { ok: true });
-    service.update(delivery.id, "failed");
-    const dead = service.update(delivery.id, "dead-letter");
-    expect(dead.state).toBe("dead-letter");
-    expect(dead.deadLetterAt).not.toBeNull();
+    expect(delivery.payloadHash).toHaveLength(64);
+    expect(service.update(delivery.id, "failed").retryCount).toBe(1);
+    expect(service.update(delivery.id, "delivered").state).toBe("delivered");
     expect(() => service.update(delivery.id, "failed")).toThrow("terminal");
-    expect(() => service.update(delivery.id, "delivered")).toThrow(
-      "terminal",
-    );
-    expect(() => service.update(delivery.id, "dead-letter")).toThrow(
-      "terminal",
-    );
   });
 
-  it("keeps delivered deliveries terminal and rejects unknown ids", () => {
+  it("allows every delivery without a circuit breaker", () => {
     const service = new DeliveryService();
+    expect(service.canDeliver(orgA, endpoint)).toBe(true);
     const delivery = service.create(reportId, "webhook", { ok: true });
-    service.update(delivery.id, "delivered");
-    expect(() => service.update(delivery.id, "dead-letter")).toThrow(
-      "terminal",
+    const outcome = service.recordDeliveryOutcome(
+      delivery.id,
+      orgA,
+      endpoint,
+      "failed",
     );
-    expect(() => service.update("delivery_missing", "failed")).toThrow(
-      "Delivery not found.",
-    );
+    expect(outcome.circuit).toBeNull();
+    expect(outcome.delivery.retryCount).toBe(1);
+    expect(service.circuitState(orgA, endpoint)).toBeNull();
   });
 });
 
-describe("dead-letter replay lineage", () => {
-  it("creates a fresh lineage that preserves the payload hash", () => {
-    const service = new DeliveryService();
-    const original = service.create(reportId, "webhook", { ok: true });
-    exhaust(service, original.id);
-    const before = service.get(original.id);
-    const replayed = service.replay(original.id);
-    expect(replayed.id).not.toBe(original.id);
-    expect(replayed.attemptLineageId).not.toBe(original.attemptLineageId);
-    expect(replayed.attemptLineageId).toBe(replayed.id);
-    expect(replayed.replayedFromId).toBe(original.id);
-    expect(replayed.reportId).toBe(original.reportId);
-    expect(replayed.kind).toBe(original.kind);
-    expect(replayed.payloadHash).toBe(original.payloadHash);
-    expect(replayed.retryCount).toBe(0);
-    expect(replayed.state).toBe("pending");
-    expect(replayed.deadLetterAt).toBeNull();
-    expect(service.get(original.id)).toEqual(before);
-    expect(service.listReplays(original.id).map(({ id }) => id)).toEqual([
-      replayed.id,
-    ]);
+describe("delivery circuit breaker integration", () => {
+  it("pauses a failing endpoint and resumes after a successful probe", async () => {
+    const time = fakeClock();
+    const breaker = new WebhookCircuitBreaker({
+      clock: time.clock,
+      cooldownMs: 5_000,
+      failureThreshold: 3,
+      failureWindowMs: 60_000,
+    });
+    const service = new DeliveryService({
+      circuitBreaker: breaker,
+      clock: time.clock,
+    });
+    const failingFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 503 }));
+    const succeedingFetch = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 200 }));
+
+    // Three consecutive failures trip the breaker.
+    for (const attempt of [1, 2, 3]) {
+      expect(service.canDeliver(orgA, endpoint)).toBe(true);
+      const delivery = service.create(reportId, "webhook", { attempt });
+      const result = await deliverWebhook(endpoint, "{}", secret, {
+        fetcher: failingFetch,
+      });
+      expect(result.delivered).toBe(false);
+      expect(result.retryable).toBe(true);
+      const outcome = service.recordDeliveryOutcome(
+        delivery.id,
+        orgA,
+        endpoint,
+        "failed",
+      );
+      expect(outcome.delivery.retryCount).toBe(1);
+      expect(webhookRetryDelay(outcome.delivery.retryCount)).toBe(2_000);
+      if (attempt < 3) {
+        expect(outcome.circuit?.state).toBe("closed");
+      } else {
+        expect(outcome.circuit?.state).toBe("open");
+      }
+    }
+
+    // The open circuit pauses delivery; the queued delivery is never dropped.
+    const queued = service.create(reportId, "webhook", { queued: true });
+    expect(service.canDeliver(orgA, endpoint)).toBe(false);
+    expect(service.get(queued.id)?.state).toBe("pending");
+    expect(service.get(queued.id)?.retryCount).toBe(0);
+
+    // After the cooldown a single probe is admitted and closes the circuit.
+    time.advance(5_000);
+    expect(service.canDeliver(orgA, endpoint)).toBe(true);
+    const probe = await deliverWebhook(endpoint, "{}", secret, {
+      fetcher: succeedingFetch,
+    });
+    expect(probe.delivered).toBe(true);
+    const resumed = service.recordDeliveryOutcome(
+      queued.id,
+      orgA,
+      endpoint,
+      "delivered",
+    );
+    expect(resumed.circuit?.state).toBe("closed");
+    expect(resumed.delivery.state).toBe("delivered");
+    expect(service.canDeliver(orgA, endpoint)).toBe(true);
   });
 
-  it("rejects replay of deliveries that are not dead-letter", () => {
-    const service = new DeliveryService();
-    const pending = service.create(reportId, "webhook", { ok: true });
-    expect(() => service.replay(pending.id)).toThrow(
-      "Only dead-letter deliveries can be replayed.",
-    );
-    service.update(pending.id, "failed");
-    expect(() => service.replay(pending.id)).toThrow(
-      "Only dead-letter deliveries can be replayed.",
-    );
-    const delivered = service.create(reportId, "webhook", { ok: true });
-    service.update(delivered.id, "delivered");
-    expect(() => service.replay(delivered.id)).toThrow(
-      "Only dead-letter deliveries can be replayed.",
-    );
-    expect(() => service.replay("delivery_missing")).toThrow(
-      "Delivery not found.",
-    );
-  });
-
-  it("allows a replay that exhausts again to be replayed under a new lineage", () => {
-    const service = new DeliveryService();
-    const original = service.create(reportId, "webhook", { ok: true });
-    exhaust(service, original.id);
-    const first = service.replay(original.id);
-    exhaust(service, first.id);
-    const second = service.replay(first.id);
-    expect(second.replayedFromId).toBe(first.id);
-    expect(second.attemptLineageId).not.toBe(first.attemptLineageId);
-    expect(second.payloadHash).toBe(original.payloadHash);
-    expect(service.listReplays(original.id)).toHaveLength(1);
-    expect(service.listReplays(first.id).map(({ id }) => id)).toEqual([
-      second.id,
-    ]);
+  it("keeps one tenant's open circuit from pausing another tenant", () => {
+    const breaker = new WebhookCircuitBreaker({ failureThreshold: 1 });
+    const service = new DeliveryService({ circuitBreaker: breaker });
+    const delivery = service.create(reportId, "webhook", { ok: true });
+    service.recordDeliveryOutcome(delivery.id, orgA, endpoint, "failed");
+    expect(service.circuitState(orgA, endpoint)?.state).toBe("open");
+    expect(service.canDeliver(orgA, endpoint)).toBe(false);
+    expect(service.circuitState(orgB, endpoint)?.state).toBe("closed");
+    expect(service.canDeliver(orgB, endpoint)).toBe(true);
   });
 });

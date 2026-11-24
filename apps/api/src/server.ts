@@ -22,6 +22,7 @@ import {
   type Run,
   type RunClaim,
   type RunRepository,
+  type TargetAddressResolver,
 } from "../../../packages/platform/src/index.js";
 
 const version = "0.1.0";
@@ -165,6 +166,7 @@ export class ReferenceRunExecutor {
       readonly allowedOrigins?: readonly string[];
       readonly clock?: () => Date;
       readonly fetcher?: typeof fetch;
+      readonly resolver?: TargetAddressResolver;
     } = {},
   ) {
     this.runs = new RunService({
@@ -208,6 +210,7 @@ export class ReferenceRunExecutor {
     const probe = await probeTarget(targetOrigin, {
       ...(this.options.clock ? { clock: this.options.clock } : {}),
       ...(this.options.fetcher ? { fetcher: this.options.fetcher } : {}),
+      ...(this.options.resolver ? { resolver: this.options.resolver } : {}),
     });
     const supportsSep1 = probe.supportedSeps.some((sep) =>
       /^SEP-?0*1$/iu.test(sep),

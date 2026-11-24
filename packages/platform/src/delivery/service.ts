@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { createId, type OpaqueId } from "../../../domain/src/index.js";
+import type {
+  CircuitSnapshot,
+  WebhookCircuitBreaker,
+} from "./circuit-breaker.js";
 
 export type DeliveryState = "dead-letter" | "delivered" | "failed" | "pending";
 
@@ -21,6 +25,11 @@ export interface Delivery {
   readonly updatedAt: string;
 }
 
+export interface DeliveryOutcome {
+  readonly circuit: CircuitSnapshot | null;
+  readonly delivery: Delivery;
+}
+
 const terminalStates: ReadonlySet<DeliveryState> = new Set([
   "dead-letter",
   "delivered",
@@ -29,8 +38,15 @@ const terminalStates: ReadonlySet<DeliveryState> = new Set([
 export class DeliveryService {
   private readonly deliveries = new Map<string, Delivery>();
   private readonly clock: () => Date;
+  private readonly circuitBreaker: WebhookCircuitBreaker | undefined;
 
-  constructor(options: { readonly clock?: () => Date } = {}) {
+  constructor(
+    options: {
+      readonly circuitBreaker?: WebhookCircuitBreaker;
+      readonly clock?: () => Date;
+    } = {},
+  ) {
+    this.circuitBreaker = options.circuitBreaker;
     this.clock = options.clock ?? (() => new Date());
   }
 
@@ -70,8 +86,7 @@ export class DeliveryService {
       state === "dead-letter" || exhausted ? "dead-letter" : state;
     const updated = Object.freeze({
       ...delivery,
-      deadLetterAt:
-        nextState === "dead-letter" ? now : delivery.deadLetterAt,
+      deadLetterAt: nextState === "dead-letter" ? now : delivery.deadLetterAt,
       retryCount,
       state: nextState,
       updatedAt: now,
@@ -128,5 +143,31 @@ export class DeliveryService {
     return [...this.deliveries.values()].filter(
       (delivery) => delivery.replayedFromId === originalId,
     );
+  }
+
+  canDeliver(organizationId: string, endpoint: string): boolean {
+    return this.circuitBreaker?.allowDelivery(organizationId, endpoint) ?? true;
+  }
+
+  recordDeliveryOutcome(
+    id: string,
+    organizationId: string,
+    endpoint: string,
+    outcome: "delivered" | "failed",
+  ): DeliveryOutcome {
+    const delivery = this.update(id, outcome);
+    const circuit = this.circuitBreaker
+      ? outcome === "delivered"
+        ? this.circuitBreaker.recordSuccess(organizationId, endpoint)
+        : this.circuitBreaker.recordFailure(organizationId, endpoint)
+      : null;
+    return { circuit, delivery };
+  }
+
+  circuitState(
+    organizationId: string,
+    endpoint: string,
+  ): CircuitSnapshot | null {
+    return this.circuitBreaker?.state(organizationId, endpoint) ?? null;
   }
 }
