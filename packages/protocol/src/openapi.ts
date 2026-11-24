@@ -42,7 +42,7 @@ export const openApiDocument = {
       },
       IdempotencyKey: {
         description:
-          "Caller-generated key that identifies one mutation request.",
+          "Caller-generated key that identifies one mutation request. Retrying with the same key returns the original execution instead of creating a duplicate. Scheduled executions use a stable occurrence key of the form schedule:<schedule-id>:<occurrence-timestamp>, so retries and scheduler failover remain idempotent across process boundaries.",
         in: "header",
         name: "Idempotency-Key",
         required: true,
@@ -102,6 +102,12 @@ export const openApiDocument = {
         required: true,
         schema: { $ref: "#/components/schemas/SessionId" },
       },
+      DeliveryPathId: {
+        in: "path",
+        name: "deliveryId",
+        required: true,
+        schema: { $ref: "#/components/schemas/DeliveryId" },
+      },
     },
     responses: {
       Problem: {
@@ -113,7 +119,8 @@ export const openApiDocument = {
                 summary: "Authorization error",
                 value: {
                   detail: "The actor is not authorized for this operation.",
-                  instance: "/v1/projects/project_00000000-0000-4000-8000-000000000001",
+                  instance:
+                    "/v1/projects/project_00000000-0000-4000-8000-000000000001",
                   reason: "role_missing",
                   requestId: "request_00000000-0000-4000-8000-000000000002",
                   status: 403,
@@ -134,7 +141,8 @@ export const openApiDocument = {
                 },
               },
               rateLimit: {
-                description: "Rate limit has been exceeded for the request window.",
+                description:
+                  "Rate limit has been exceeded for the request window.",
                 summary: "Rate limit error",
                 value: {
                   detail: "Too many requests. Please retry after 30 seconds.",
@@ -537,6 +545,58 @@ export const openApiDocument = {
         },
         type: "object",
       },
+      DeliveryId: {
+        pattern:
+          "^delivery_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        type: "string",
+      },
+      Delivery: {
+        additionalProperties: false,
+        properties: {
+          attemptLineageId: { type: "string" },
+          createdAt: { $ref: "#/components/schemas/UtcTimestamp" },
+          deadLetterAt: {
+            oneOf: [
+              { $ref: "#/components/schemas/UtcTimestamp" },
+              { type: "null" },
+            ],
+          },
+          id: { $ref: "#/components/schemas/DeliveryId" },
+          kind: { enum: ["export", "webhook"], type: "string" },
+          payloadHash: { pattern: "^[0-9a-f]{64}$", type: "string" },
+          replayedFromId: {
+            oneOf: [
+              { $ref: "#/components/schemas/DeliveryId" },
+              { type: "null" },
+            ],
+          },
+          reportId: {
+            pattern:
+              "^report_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            type: "string",
+          },
+          retryCount: { minimum: 0, type: "integer" },
+          state: {
+            enum: ["pending", "failed", "delivered", "dead-letter"],
+            type: "string",
+          },
+          updatedAt: { $ref: "#/components/schemas/UtcTimestamp" },
+        },
+        required: [
+          "attemptLineageId",
+          "createdAt",
+          "deadLetterAt",
+          "id",
+          "kind",
+          "payloadHash",
+          "replayedFromId",
+          "reportId",
+          "retryCount",
+          "state",
+          "updatedAt",
+        ],
+        type: "object",
+      },
       PageInfo: {
         additionalProperties: false,
         properties: {
@@ -714,6 +774,87 @@ export const openApiDocument = {
         pattern:
           "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
         type: "string",
+      },
+      MisfirePolicy: {
+        description:
+          "Policy applied to scheduled runs missed during downtime. skip drops missed runs, run-once executes a single missed run, and catch-up replays missed runs up to the schedule's bounded limit.",
+        enum: ["skip", "run-once", "catch-up"],
+        type: "string",
+      },
+      Schedule: {
+        additionalProperties: false,
+        properties: {
+          enabled: { type: "boolean" },
+          id: { pattern: "^[a-z][a-z0-9_-]{2,63}$", type: "string" },
+          intervalSeconds: {
+            maximum: 31536000,
+            minimum: 60,
+            type: "integer",
+          },
+          lastMisfire: {
+            oneOf: [
+              { $ref: "#/components/schemas/ScheduleMisfireRecovery" },
+              { type: "null" },
+            ],
+          },
+          maxCatchUp: { maximum: 10, minimum: 1, type: "integer" },
+          misfirePolicy: { $ref: "#/components/schemas/MisfirePolicy" },
+          nextRunAt: { $ref: "#/components/schemas/UtcTimestamp" },
+        },
+        required: [
+          "enabled",
+          "id",
+          "intervalSeconds",
+          "lastMisfire",
+          "maxCatchUp",
+          "misfirePolicy",
+          "nextRunAt",
+        ],
+        type: "object",
+      },
+      ScheduleMisfireRecovery: {
+        additionalProperties: false,
+        properties: {
+          auditMetadata: {
+            additionalProperties: false,
+            properties: {
+              executions_due: { minimum: 0, type: "integer" },
+              misfire_capped: { type: "boolean" },
+              misfire_policy: {
+                $ref: "#/components/schemas/MisfirePolicy",
+              },
+              missed_occurrences: { minimum: 0, type: "integer" },
+              schedule_id: {
+                pattern: "^[a-z][a-z0-9_-]{2,63}$",
+                type: "string",
+              },
+            },
+            required: [
+              "executions_due",
+              "misfire_capped",
+              "misfire_policy",
+              "missed_occurrences",
+              "schedule_id",
+            ],
+            type: "object",
+          },
+          capped: { type: "boolean" },
+          executionsDue: { minimum: 0, type: "integer" },
+          missedOccurrences: { minimum: 0, type: "integer" },
+          nextRunAt: { $ref: "#/components/schemas/UtcTimestamp" },
+          policy: { $ref: "#/components/schemas/MisfirePolicy" },
+          scheduleId: { pattern: "^[a-z][a-z0-9_-]{2,63}$", type: "string" },
+        },
+        required: [
+          "auditMetadata",
+          "capped",
+          "executionsDue",
+          "missedOccurrences",
+          "nextRunAt",
+          "policy",
+          "scheduleId",
+        ],
+        type: "object",
       },
     },
     securitySchemes: {
@@ -1628,6 +1769,63 @@ export const openApiDocument = {
         tags: ["Targets"],
       },
     },
+    "/v1/deliveries/dead-letter": {
+      get: {
+        operationId: "listDeadLetterDeliveries",
+        parameters: [...protectedOperationParameters],
+        responses: {
+          "200": jsonResponse("Dead-letter deliveries.", {
+            items: { $ref: "#/components/schemas/Delivery" },
+            type: "array",
+          }),
+          "401": { $ref: "#/components/responses/Problem" },
+          "403": { $ref: "#/components/responses/Problem" },
+        },
+        summary: "List dead-letter deliveries",
+        tags: ["Deliveries"],
+      },
+    },
+    "/v1/deliveries/{deliveryId}": {
+      get: {
+        operationId: "getDelivery",
+        parameters: [
+          ...protectedOperationParameters,
+          { $ref: "#/components/parameters/DeliveryPathId" },
+        ],
+        responses: {
+          "200": jsonResponse("Delivery.", {
+            $ref: "#/components/schemas/Delivery",
+          }),
+          "401": { $ref: "#/components/responses/Problem" },
+          "403": { $ref: "#/components/responses/Problem" },
+          "404": { $ref: "#/components/responses/Problem" },
+        },
+        summary: "Get a delivery",
+        tags: ["Deliveries"],
+      },
+    },
+    "/v1/deliveries/{deliveryId}/replay": {
+      post: {
+        operationId: "replayDeadLetterDelivery",
+        parameters: [
+          ...mutationOperationParameters,
+          { $ref: "#/components/parameters/DeliveryPathId" },
+        ],
+        responses: {
+          "202": jsonResponse(
+            "Replay accepted; the new attempt lineage is pending delivery.",
+            { $ref: "#/components/schemas/Delivery" },
+          ),
+          "400": { $ref: "#/components/responses/Problem" },
+          "401": { $ref: "#/components/responses/Problem" },
+          "403": { $ref: "#/components/responses/Problem" },
+          "404": { $ref: "#/components/responses/Problem" },
+          "409": { $ref: "#/components/responses/Problem" },
+        },
+        summary: "Replay a dead-letter delivery",
+        tags: ["Deliveries"],
+      },
+    },
   },
   security: [{ bearerAuth: [] }],
   servers: [{ url: "https://api.rampspec.dev" }],
@@ -1656,6 +1854,11 @@ export const openApiDocument = {
     {
       description: "A constrained, durable SEP-1 reviewer workflow.",
       name: "Reference runs",
+    },
+    {
+      description:
+        "Dead-letter webhook deliveries and authorized operator replay.",
+      name: "Deliveries",
     },
   ],
 } as const;
