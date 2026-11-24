@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { createId, parseId, type OpaqueId } from "../../../domain/src/index.js";
+import { RunQuotaManager } from "../security/rate-limit.js";
 
 export type RunState =
   | "blocked"
@@ -71,15 +72,32 @@ export interface CreateRunInput {
   readonly effectiveConfig: Readonly<Record<string, unknown>>;
 }
 
+export class QuotaExceededError extends Error {
+  readonly code = "quota_exceeded";
+  readonly status = 429;
+
+  constructor(
+    readonly type: "concurrent" | "windowed",
+    readonly retryAfterSeconds: number,
+    readonly detail: string,
+  ) {
+    super(detail);
+    this.name = "QuotaExceededError";
+  }
+}
+
 export class RunService {
   private readonly clock: () => Date;
   private readonly repository: RunRepository;
+  private readonly quotaManager?: RunQuotaManager;
 
   constructor(options: {
     readonly repository: RunRepository;
+    readonly quotaManager?: RunQuotaManager;
     readonly clock?: () => Date;
   }) {
     this.repository = options.repository;
+    this.quotaManager = options.quotaManager;
     this.clock = options.clock ?? (() => new Date());
   }
 
@@ -100,6 +118,14 @@ export class RunService {
       throw new Error("Invalid idempotency key.");
     }
     const organizationId = parseId("organization", input.organizationId);
+    const concurrent = this.quotaManager?.checkConcurrent(input.organizationId);
+    if (concurrent && !concurrent.allowed) {
+      throw new QuotaExceededError("concurrent", concurrent.retryAfterSeconds, "Concurrent run limit exceeded.");
+    }
+    const windowed = this.quotaManager?.checkWindowed(input.organizationId);
+    if (windowed && !windowed.allowed) {
+      throw new QuotaExceededError("windowed", windowed.retryAfterSeconds, "Windowed run limit exceeded.");
+    }
     const run: Run = Object.freeze({
       createdAt: this.clock().toISOString(),
       effectiveConfig: Object.freeze(structuredClone(input.effectiveConfig)),
@@ -113,7 +139,9 @@ export class RunService {
       suiteVersion: input.suiteVersion,
       targetId: parseId("target", input.targetId),
     });
-    return this.repository.claim(run);
+    const claim = await this.repository.claim(run);
+    if (claim.created) this.quotaManager?.recordWindowed(input.organizationId);
+    return claim;
   }
 }
 

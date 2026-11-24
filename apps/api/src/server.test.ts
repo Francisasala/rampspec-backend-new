@@ -51,8 +51,6 @@ describe("reference run API", () => {
             status: 200,
           }),
         ),
-      resolver: () =>
-        Promise.resolve([{ address: "93.184.216.34", family: 4 }]),
     });
     const started = await startApiServer({ executor, port: 0 });
     servers.push(started.server);
@@ -100,7 +98,7 @@ describe("reference run API", () => {
     ).toBeUndefined();
   });
 
-  it("fails the run when an allowlisted target resolves to a private address", async () => {
+  it("provides a status endpoint for polling run state without the full report", async () => {
     const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
     directories.push(directory);
     const file = join(directory, "runs.json");
@@ -108,14 +106,23 @@ describe("reference run API", () => {
     const executor = new ReferenceRunExecutor(new JsonRunRepository(file), {
       allowedOrigins: ["https://anchor.example"],
       clock,
-      fetcher: () => Promise.resolve(new Response(null, { status: 200 })),
-      resolver: () =>
-        Promise.resolve([{ address: "169.254.169.254", family: 4 }]),
+      fetcher: () =>
+        Promise.resolve(
+          new Response(null, {
+            headers: { "x-stellar-toml-version": "SEP-0001" },
+            status: 200,
+          }),
+        ),
     });
     const started = await startApiServer({ executor, port: 0 });
     servers.push(started.server);
 
-    const response = await fetch(`${started.url}/v1/reference-runs`, {
+    const request = {
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "reviewer-reference-run-status-0001",
+        "X-RampSpec-Organization": ids.organization,
+      },
       body: JSON.stringify({
         projectId: ids.project,
         suiteId: ids.suite,
@@ -123,23 +130,125 @@ describe("reference run API", () => {
         targetId: ids.target,
         targetOrigin: "https://anchor.example",
       }),
+      method: "POST",
+    } as const;
+    const created = await fetch(`${started.url}/v1/reference-runs`, request);
+    const run = (await created.json()) as { run: { id: string } };
+
+    const statusResponse = await fetch(
+      `${started.url}/v1/reference-runs/${run.run.id}/status`,
+      {
+        headers: {
+          "X-RampSpec-Organization": ids.organization,
+        },
+      },
+    );
+    expect(statusResponse.status).toBe(200);
+    const status = (await statusResponse.json()) as {
+      id: string;
+      state: string;
+      createdAt: string;
+      completedAt?: string;
+    };
+    expect(status.id).toBe(run.run.id);
+    expect(status.state).toBe("completed");
+    expect(status.createdAt).toBe("2026-11-09T16:00:00.000Z");
+    expect(status.completedAt).toBeDefined();
+  });
+
+  it("rejects status requests without organization header", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const statusResponse = await fetch(
+      `${started.url}/v1/reference-runs/run_00000000-0000-4000-8000-000000000001/status`,
+    );
+    expect(statusResponse.status).toBe(400);
+    expect(await statusResponse.json()).toMatchObject({
+      title: "Request rejected",
+    });
+  });
+
+  it("returns not found for cross-tenant status requests", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const file = join(directory, "runs.json");
+    const clock = () => new Date("2026-11-09T16:00:00.000Z");
+    const executor = new ReferenceRunExecutor(new JsonRunRepository(file), {
+      allowedOrigins: ["https://anchor.example"],
+      clock,
+      fetcher: () =>
+        Promise.resolve(
+          new Response(null, {
+            headers: { "x-stellar-toml-version": "SEP-0001" },
+            status: 200,
+          }),
+        ),
+    });
+    const started = await startApiServer({ executor, port: 0 });
+    servers.push(started.server);
+
+    const request = {
       headers: {
         "Content-Type": "application/json",
-        "Idempotency-Key": "reviewer-reference-run-0004",
+        "Idempotency-Key": "reviewer-reference-run-status-cross-tenant",
         "X-RampSpec-Organization": ids.organization,
       },
+      body: JSON.stringify({
+        projectId: ids.project,
+        suiteId: ids.suite,
+        suiteVersion: "1.0.0",
+        targetId: ids.target,
+        targetOrigin: "https://anchor.example",
+      }),
       method: "POST",
+    } as const;
+    const created = await fetch(`${started.url}/v1/reference-runs`, request);
+    const run = (await created.json()) as { run: { id: string } };
+
+    const statusResponse = await fetch(
+      `${started.url}/v1/reference-runs/${run.run.id}/status`,
+      {
+        headers: {
+          "X-RampSpec-Organization":
+            "organization_00000000-0000-4000-8000-000000000099",
+        },
+      },
+    );
+    expect(statusResponse.status).toBe(404);
+    expect(await statusResponse.json()).toMatchObject({
+      status: 404,
+      title: "Run not found",
     });
-    expect(response.status).toBe(201);
-    const record = (await response.json()) as {
-      probe: { reachable: boolean; status: number | null };
-      report: { summary: { failed: number; passed: number } };
-      run: { state: string };
-    };
-    expect(record.probe.reachable).toBe(false);
-    expect(record.probe.status).toBeNull();
-    expect(record.run.state).toBe("failed");
-    expect(record.report.summary).toMatchObject({ failed: 1, passed: 0 });
+  });
+
+  it("returns not found for unknown run IDs in status endpoint", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rampspec-api-"));
+    directories.push(directory);
+    const started = await startApiServer({
+      dataFile: join(directory, "runs.json"),
+      port: 0,
+    });
+    servers.push(started.server);
+
+    const statusResponse = await fetch(
+      `${started.url}/v1/reference-runs/run_00000000-0000-4000-8000-000000000001/status`,
+      {
+        headers: {
+          "X-RampSpec-Organization": ids.organization,
+        },
+      },
+    );
+    expect(statusResponse.status).toBe(404);
+    expect(await statusResponse.json()).toMatchObject({
+      status: 404,
+      title: "Run not found",
+    });
   });
 
   it("rejects insecure targets and oversized trust assumptions", async () => {

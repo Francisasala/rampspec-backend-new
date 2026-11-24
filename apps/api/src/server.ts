@@ -15,6 +15,8 @@ import {
   defaultMetrics,
   generateReport,
   probeTarget,
+  QuotaExceededError,
+  RunQuotaManager,
   RunService,
   type CapabilityProbe,
   type GeneratedReport,
@@ -159,6 +161,7 @@ export class JsonRunRepository implements RunRepository {
 
 export class ReferenceRunExecutor {
   private readonly runs: RunService;
+  private readonly quotaManager: RunQuotaManager;
 
   public constructor(
     private readonly repository: JsonRunRepository,
@@ -166,11 +169,19 @@ export class ReferenceRunExecutor {
       readonly allowedOrigins?: readonly string[];
       readonly clock?: () => Date;
       readonly fetcher?: typeof fetch;
+      readonly quotaManager?: RunQuotaManager;
       readonly resolver?: TargetAddressResolver;
     } = {},
   ) {
+    this.quotaManager = options.quotaManager ?? new RunQuotaManager({
+      concurrentLimit: 10,
+      windowedLimit: 100,
+      windowMs: 60_000,
+      ...(options.clock ? { clock: options.clock } : {}),
+    });
     this.runs = new RunService({
       repository,
+      quotaManager: this.quotaManager,
       ...(options.clock ? { clock: options.clock } : {}),
     });
   }
@@ -430,7 +441,7 @@ export function createApiHandler(
         sendJson(response, 201, result);
         return;
       }
-      const match = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)$/u.exec(
+      const match = /^\/v1\/reference-runs\/(run_[0-9a-f-]+)(?:\/status)?$/u.exec(
         url.pathname,
       );
       if (request.method === "GET" && match?.[1]) {
@@ -442,11 +453,34 @@ export function createApiHandler(
           sendJson(response, 404, { status: 404, title: "Run not found" });
           return;
         }
-        sendJson(response, 200, record);
+        if (url.pathname.endsWith("/status")) {
+          sendJson(response, 200, {
+            id: record.run.id,
+            state: record.run.state,
+            createdAt: record.run.createdAt,
+            ...(record.run.state === "completed" || record.run.state === "failed"
+              ? { completedAt: record.report?.createdAt ?? record.run.createdAt }
+              : {}),
+          });
+        } else {
+          sendJson(response, 200, record);
+        }
         return;
       }
       sendJson(response, 404, { status: 404, title: "Route not found" });
     } catch (error) {
+      if (error instanceof QuotaExceededError) {
+        response.setHeader("Retry-After", error.retryAfterSeconds.toString());
+        sendJson(response, error.status, {
+          code: error.code,
+          detail: error.message,
+          retryAfterSeconds: error.retryAfterSeconds,
+          status: error.status,
+          title: `${error.type} quota exceeded`,
+          type: `https://rampspec.dev/problems/quota-exceeded-${error.type}`,
+        });
+        return;
+      }
       if (error instanceof PayloadTooLargeError) {
         sendJson(response, 413, {
           detail: error.message,
