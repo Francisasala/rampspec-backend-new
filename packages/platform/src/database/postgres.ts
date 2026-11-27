@@ -2,8 +2,8 @@ import { performance } from "node:perf_hooks";
 
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 
-import type { AppliedMigration, Migration } from "./migrations.js";
-import { planMigrations, planRollback } from "./migrations.js";
+import type { AppliedMigration, Migration, MigrationDryRunResult } from "./migrations.js";
+import { dryRunMigrations, planMigrations, planRollback } from "./migrations.js";
 
 /** PostgreSQL serialization failure code: 40001 (serialization_failure) and 40P01 (deadlock_detected) */
 export const RETRYABLE_SQL_STATES = new Set(["40001", "40P01"]);
@@ -250,6 +250,27 @@ export class PostgresMigrationRunner {
         await this.applyOne(connection, migration, "schema_migrations");
       return pending.length;
     });
+  }
+
+  async dryRun(migrations: readonly Migration[]): Promise<MigrationDryRunResult> {
+    const client = await this.pool.connect();
+    const connection = new Connection(client);
+    try {
+      const tableCheck = await connection.query<{ readonly exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM information_schema.tables
+           WHERE table_schema = 'rampspec' AND table_name = 'schema_migrations'
+         ) AS exists`,
+      );
+      let appliedMigrations: readonly AppliedMigration[] = [];
+      if (tableCheck[0]?.exists) {
+        appliedMigrations = await this.applied(connection, "schema_migrations");
+      }
+      return dryRunMigrations(migrations, appliedMigrations);
+    } finally {
+      client.release();
+    }
   }
 
   async seed(

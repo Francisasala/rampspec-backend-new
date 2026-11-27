@@ -1,21 +1,104 @@
+export type DependencyName = "database" | "objectStore" | "scheduler" | "signing" | (string & {});
+
+export interface ComponentReadiness {
+  readonly ready: boolean;
+  readonly status: "ready" | "not_ready";
+}
+
+export interface ReadinessResult {
+  readonly checks: Readonly<Record<string, boolean>>;
+  readonly components: Readonly<Record<string, ComponentReadiness>>;
+  readonly status: "ready" | "not_ready";
+}
+
 export interface HealthCheck {
-  readonly name: string;
   readonly check: () => Promise<boolean>;
+  readonly name: string;
+  readonly timeoutMs?: number;
+}
+
+export interface StandardReadinessChecks {
+  readonly database: () => Promise<boolean>;
+  readonly objectStore: () => Promise<boolean>;
+  readonly scheduler: () => Promise<boolean>;
+  readonly signing: () => Promise<boolean>;
+}
+
+const DEFAULT_TIMEOUT_MS = 5000;
+
+function executeBoundedCheck(
+  check: () => Promise<boolean>,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(false);
+      }
+    }, timeoutMs);
+
+    Promise.resolve()
+      .then(() => check())
+      .then(
+        (res) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(Boolean(res));
+          }
+        },
+        () => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(false);
+          }
+        },
+      );
+  });
 }
 
 export async function readiness(
   checks: readonly HealthCheck[],
-): Promise<{
-  readonly status: "ready" | "not_ready";
-  readonly checks: Readonly<Record<string, boolean>>;
-}> {
-  const results: Record<string, boolean> = {};
-  for (const check of checks)
-    results[check.name] = await check.check().catch(() => false);
+  options: { readonly timeoutMs?: number } = {},
+): Promise<ReadinessResult> {
+  const checksMap: Record<string, boolean> = {};
+  const componentsMap: Record<string, ComponentReadiness> = {};
+
+  await Promise.all(
+    checks.map(async (check) => {
+      const timeout = check.timeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      const isReady = await executeBoundedCheck(check.check, timeout);
+      checksMap[check.name] = isReady;
+      componentsMap[check.name] = {
+        ready: isReady,
+        status: isReady ? "ready" : "not_ready",
+      };
+    }),
+  );
+
+  const isAllReady = Object.values(checksMap).length > 0 && Object.values(checksMap).every(Boolean);
+
   return {
-    checks: results,
-    status: Object.values(results).every(Boolean) ? "ready" : "not_ready",
+    checks: checksMap,
+    components: componentsMap,
+    status: isAllReady ? "ready" : "not_ready",
   };
+}
+
+export async function checkStandardReadiness(
+  checks: StandardReadinessChecks,
+  options: { readonly timeoutMs?: number } = {},
+): Promise<ReadinessResult> {
+  const healthChecks: HealthCheck[] = [
+    { check: checks.database, name: "database" },
+    { check: checks.objectStore, name: "objectStore" },
+    { check: checks.scheduler, name: "scheduler" },
+    { check: checks.signing, name: "signing" },
+  ];
+  return readiness(healthChecks, options);
 }
 
 export function liveness(): { readonly status: "ok" } {
@@ -25,13 +108,9 @@ export function liveness(): { readonly status: "ok" } {
 export type WorkerState = "healthy" | "delayed" | "offline";
 
 export interface WorkerHeartbeatConfig {
-  /** Milliseconds before a worker without a heartbeat is marked delayed. Default 10000ms. */
   readonly delayedThresholdMs?: number;
-  /** Milliseconds before a worker without a heartbeat is marked offline and expired. Default 30000ms. */
   readonly offlineThresholdMs?: number;
-  /** Max acceptable clock skew in milliseconds to protect against transient jumps. Default 5000ms. */
   readonly maxClockSkewMs?: number;
-  /** Optional custom clock for deterministic testing. */
   readonly clock?: () => number;
 }
 
@@ -55,7 +134,6 @@ export class WorkerHeartbeatTracker {
     this.offlineThresholdMs = config.offlineThresholdMs ?? 30_000;
     this.maxClockSkewMs = config.maxClockSkewMs ?? 5_000;
     this.clock = config.clock ?? (() => Date.now());
-
     if (this.delayedThresholdMs <= 0 || this.offlineThresholdMs <= this.delayedThresholdMs) {
       throw new Error("Invalid timeout thresholds: offlineThresholdMs must exceed delayedThresholdMs > 0.");
     }
@@ -66,30 +144,19 @@ export class WorkerHeartbeatTracker {
       throw new Error("Worker ID must be a non-empty string.");
     }
     const now = this.clock();
-    const ts = timestamp ?? now;
-
-    if (!Number.isFinite(ts)) {
-      throw new Error("Invalid heartbeat timestamp.");
-    }
-
-    // Guard against future timestamps exceeding allowed clock skew
-    if (ts > now + this.maxClockSkewMs) {
+    const heartbeat = timestamp ?? now;
+    if (!Number.isFinite(heartbeat)) throw new Error("Invalid heartbeat timestamp.");
+    if (heartbeat > now + this.maxClockSkewMs) {
       throw new Error("Heartbeat timestamp exceeds acceptable clock skew.");
     }
-
-    // Guard against stale heartbeats older than an already recorded newer heartbeat
     const existing = this.workers.get(workerId);
-    if (existing !== undefined && ts < existing) {
-      return;
-    }
-
-    this.workers.set(workerId, Math.min(ts, now));
+    if (existing !== undefined && heartbeat < existing) return;
+    this.workers.set(workerId, Math.min(heartbeat, now));
   }
 
   getWorkerStatus(workerId: string): WorkerStatus {
     const lastHeartbeat = this.workers.get(workerId);
     const now = this.clock();
-
     if (lastHeartbeat === undefined) {
       return Object.freeze({
         elapsedMs: Number.POSITIVE_INFINITY,
@@ -99,19 +166,14 @@ export class WorkerHeartbeatTracker {
         workerId,
       });
     }
-
     const elapsedMs = Math.max(0, now - lastHeartbeat);
-    let state: WorkerState = "healthy";
-
-    if (elapsedMs >= this.offlineThresholdMs) {
-      state = "offline";
-    } else if (elapsedMs >= this.delayedThresholdMs) {
-      state = "delayed";
-    }
-
+    const state: WorkerState = elapsedMs >= this.offlineThresholdMs
+      ? "offline"
+      : elapsedMs >= this.delayedThresholdMs
+        ? "delayed"
+        : "healthy";
     return Object.freeze({
       elapsedMs,
-      // Schedulers stop assigning new work to expired (offline) workers
       isAssignable: state !== "offline",
       lastHeartbeat,
       state,
@@ -132,20 +194,13 @@ export class WorkerHeartbeatTracker {
     let healthy = 0;
     let delayed = 0;
     let offline = 0;
-
     for (const workerId of this.workers.keys()) {
-      const { state } = this.getWorkerStatus(workerId);
-      if (state === "healthy") healthy++;
-      else if (state === "delayed") delayed++;
-      else offline++;
+      const state = this.getWorkerStatus(workerId).state;
+      if (state === "healthy") healthy += 1;
+      else if (state === "delayed") delayed += 1;
+      else offline += 1;
     }
-
-    return Object.freeze({
-      delayed,
-      healthy,
-      offline,
-      totalTracked: this.workers.size,
-    });
+    return Object.freeze({ delayed, healthy, offline, totalTracked: this.workers.size });
   }
 
   removeWorker(workerId: string): boolean {
